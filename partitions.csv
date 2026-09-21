@@ -1,0 +1,19 @@
+# Name,    Type, SubType,  Offset,   Size
+# OTA 動作には otadata (data/ota) が必須。これが無いと esp_ota_set_boot_partition が
+# 起動選択を記録できず、OTA 転送完了後の End で失敗する (OTA_END_ERROR)。
+# ota_0/ota_1/spiffs のオフセットは従来どおりに保ち、LittleFS(spiffs) のデータを温存する。
+# nvs を 0x6000→0x4000 に縮小し、空いた 0xd000 に otadata(0x2000) を挿入する。
+#
+# 8MB flash を末尾まで使い切る配分に変更 (従来は 0x610000 以降 約1.94MB が未使用)。
+#  - ota_0/ota_1: 0x180000 (1.5MB) → 0x200000 (2MB)。現行の依存関係 (FastLED 3.10 等) では
+#    solo 追加前のファームでも 1.72MB あり 1.5MB に収まらなくなっていたため。
+#  - spiffs(LittleFS): 0x300000 (3MB) → 0x3F0000 (3.94MB)。solo モードの動画置き場。
+# 注意: オフセット・サイズが変わるため、既存機には USB で書き込み直す必要があり、
+#       LittleFS の中身は失われる。`pio run -t uploadfs` で data/ を再投入すること
+#       (doc/solo_mode.md「移行手順」)。パーティション表は OTA では更新されない。
+nvs,       data, nvs,      0x9000,   0x4000
+otadata,   data, ota,      0xd000,   0x2000
+phy_init,  data, phy,      0xf000,   0x1000
+ota_0,     app,  ota_0,    0x10000,  0x200000
+ota_1,     app,  ota_1,    0x210000, 0x200000
+spiffs,    data, spiffs,   0x410000, 0x3F0000

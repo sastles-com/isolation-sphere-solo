@@ -1,0 +1,71 @@
+{
+  "system": {
+    "debug": true,
+    "PSRAM": true,
+    "opening_action": {
+      "enabled": true,
+      "duration_ms": 1200
+    },
+    "ota": {
+      "enabled": true,
+      "username": "admin",
+      "password": "sphere",
+      "listen_port": 3232
+    },
+    "paths": {
+      "config": "/config.json",
+      "layout": "/led_layouts-5strip.csv",
+      "logs": "/logs/"
+    }
+  },
+  "solo": {
+    "video_path": "/video.mjpg",
+    "http_port": 80,
+    "ap": {
+      "ssid": "isolation-sphere",
+      "password": "sphere-solo",
+      "ip": "192.168.4.1"
+    }
+  },
+  "image": {
+    "width": 320,
+    "height": 160,
+    "format": "RGB565",
+    "type": "JPEG"
+  },
+  "led": {
+    "multisample": {
+      "enabled": true,
+      "radius_px": 2.0,
+      "points": 6
+    }
+  },
+  "params": {
+    "brightness": 50
+  },
+  "sound": {
+    "enabled": true,
+    "gpio": 39,
+    "volume": 50,
+    "startup_sound": true
+  },
+  "sphere": {
+    "id": "sphere001",
+    "features": {
+      "LED": true,
+      "IMU": "BNO055",
+      "LCD": {
+        "width": 128,
+        "height": 128,
+        "rotation": 0,
+        "offset": [
+          0,
+          0
+        ],
+        "color_depth": 16,
+        "switch": true,
+        "debug": true
+      }
+    }
+  }
+}
