@@ -379,13 +379,27 @@ void LEDManager::stopRenderTask() {
     if (!_taskRunning) {
         return;
     }
-    
-    if (_renderTaskHandle) {
-        vTaskDelete(_renderTaskHandle);
-        _renderTaskHandle = nullptr;
+
+    // 協調停止にする理由 (実機 2026-09-22): 以前は vTaskDelete で即殺していたが、
+    // FASTLED_ESP32_FLASH_LOCK=1 だと show() が spi_flash_op_lock() を握っている
+    // 区間がある (20ms 周期のうち約 15ms)。そこで殺すと unlock が永久に呼ばれず、
+    // 以降フラッシュに触る処理がすべて停止する。OTA (Update.write) と
+    // /api/status (LittleFS) が固まり、ping だけ通る状態になった。
+    // フラグを立てて、タスク自身が安全な位置 (show() の外) で抜けるのを待つ。
+    _stopRequested = true;
+    for (int i = 0; i < 200 && _taskRunning; i++) {  // 最大 2 秒待つ
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
-    
-    _taskRunning = false;
+    if (_taskRunning) {
+        // 抜けてこない場合の最後の手段。ロックを握ったままの可能性があるため警告する。
+        Serial.println("[LEDManager] WARN: render task did not stop in 2s — forcing delete");
+        if (_renderTaskHandle) {
+            vTaskDelete(_renderTaskHandle);
+        }
+        _taskRunning = false;
+    }
+    _renderTaskHandle = nullptr;
+    _stopRequested = false;
     Serial.println("[LEDManager] Render task stopped");
 }
 
@@ -398,6 +412,14 @@ void LEDManager::renderTaskFunction(void* parameter) {
     // 再マッピング描画する。新フレームは adoptReadyFrame() で独立に差し替わる。
     // → IMU姿勢追従は show() 律速の高Hz(~50-60Hz)で滑らか、動画は来たぶんだけ差替。
     while (true) {
+        if (manager->_stopRequested) {
+            // show() の外で抜ける (フラッシュ操作ロックを必ず解放した状態)
+            manager->_taskRunning = false;
+            manager->_renderTaskHandle = nullptr;
+            Serial.println("[LED_Render] Task exiting (cooperative stop)");
+            vTaskDelete(nullptr);
+            return;
+        }
         unsigned long frameStart = micros();
 
         if (manager->_imageManager) {

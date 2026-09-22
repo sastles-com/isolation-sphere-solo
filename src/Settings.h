@@ -29,6 +29,16 @@ public:
     /// 明るさを更新し、遅延保存を予約する
     static void setBrightness(uint8_t percent);
 
+    /// 保存済みの XYZ 軸インジケータ表示 (無ければ fallback)
+    static bool axisIndicator(bool fallback);
+
+    /// XYZ 軸インジケータの表示状態を更新し、遅延保存を予約する
+    static void setAxisIndicator(bool enabled);
+
+    /// 保存済みの IMU 平滑フレーム数 (無ければ fallback)
+    static uint8_t imuSmoothFrames(uint8_t fallback);
+    static void setImuSmoothFrames(uint8_t n);
+
     /// 保留中の変更があれば書き込む (loop から呼ぶ)
     static void tick();
 

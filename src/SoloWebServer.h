@@ -27,6 +27,7 @@
 
 #include "ConfigManager.h"
 #include "LEDManager.h"
+#include "IMUManager.h"
 #include "NetworkManager.h"
 #include "SoloPlayer.h"
 
@@ -45,7 +46,7 @@ public:
      * @param port    リッスンポート
      */
     bool begin(ConfigManager& config, SoloPlayer& player, LEDManager& led,
-               NetworkManager& net, uint16_t port);
+               NetworkManager& net, IMUManager& imu, uint16_t port);
     void end();
     bool isRunning() const { return _server != nullptr; }
 
@@ -66,6 +67,9 @@ private:
     static esp_err_t onStop(httpd_req_t* req);
     static esp_err_t onPause(httpd_req_t* req);
     static esp_err_t onWifi(httpd_req_t* req);
+    static esp_err_t onLed(httpd_req_t* req);
+    static esp_err_t onImuGet(httpd_req_t* req);
+    static esp_err_t onImuPost(httpd_req_t* req);
 
     static esp_err_t onBrightness(httpd_req_t* req);
     static esp_err_t onUpload(httpd_req_t* req);
@@ -91,6 +95,7 @@ private:
     SoloPlayer* _player;
     LEDManager* _led;
     NetworkManager* _net;
+    IMUManager* _imu;
 
     uint8_t* _rxBuf;              ///< 受信作業バッファ (ヒープ)
     char _jsonBuf[1024];          ///< 応答組み立て (ハンドラは httpd タスクで直列実行)

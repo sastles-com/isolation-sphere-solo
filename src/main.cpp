@@ -58,7 +58,9 @@ const unsigned long PERF_LOG_INTERVAL = 2000; // 2秒に1回 性能計測ログ
 // Grove I2C バスを走査して検出アドレスを出す (診断用)。
 // BNO055 は ADR ピンにより 0x28 (L) / 0x29 (H) に応答する。
 static void scanI2cBus(uint8_t sda, uint8_t scl) {
-    Wire.begin(sda, scl, 400000);
+    // 100kHz で走査する。BNO055 はクロックストレッチが長く 400kHz では化ける。
+    // Wire.begin は 2 回目以降は周波数を再設定しないため、ここが実効クロックになる。
+    Wire.begin(sda, scl, 100000);
     delay(50);
 
     sastle::Log.printf("\n[I2C] Scanning bus (SDA=GPIO%u, SCL=GPIO%u)\n", sda, scl);
@@ -184,10 +186,19 @@ void setup() {
     // 目的は OTA: 普段の LAN に居れば PC の Wi-Fi を切り替えずに espota できる。
     network.beginStaFromStore(soloCfg.ap_ssid);
 
+    // IMU ポーリングを専用タスク (core1, 優先度3) で回す。loopTask (優先度1) から呼ぶと
+    // LCD 再描画やログで周期が乱れ (実測 中央値 22ms、最大 240ms)、描画が古い姿勢のまま
+    // 止まって「ジャンプ」に見える。描画 (優先度2) より先に走るので定刻を守れる。
+    if (imuSensor.isInitialized()) {
+        if (!imuSensor.startTask(1, 3, 4096)) {
+            sastle::Log.println("Failed to start IMU task (fallback: loop polling)");
+        }
+    }
+
     // OTA (espota) 初期化: AP が立った直後に受け口を開く。これ以降の初期化
     // (IMU / LED / 再生 / Web) で失敗・停止しても、無線での書き戻しは生き残る。
     // stopRenderTask() は _taskRunning ガードがあるため未初期化でも安全。
-    ota.begin(&ledManager);
+    ota.begin(&ledManager, &soloPlayer);
 
     // IMU初期化前に I2C バスを走査 (BNO055 の有無を切り分けるため)
     scanI2cBus(kImuI2cSda, kImuI2cScl);
@@ -196,6 +207,8 @@ void setup() {
     if (!imuSensor.begin(config)) {
         sastle::Log.println("IMU initialization failed (continuing without IMU)");
     } else {
+        imuSensor.setSmoothFrames(sastle::Settings::imuSmoothFrames(config.getImuSmoothFrames()));
+        sastle::Log.printf("IMU smoothing: %u frame(s)\n", imuSensor.smoothFrames());
         imuSensor.printStatus();
     }
 
@@ -238,6 +251,7 @@ void setup() {
 
             // config の params.brightness (0-100%) を LED 輝度 (0-255) へ適用
             ledManager.setBrightness((uint8_t)map(sastle::Settings::brightness(config.getParamBrightness()), 0, 100, 0, 255));
+            ledManager.setAxisIndicator(sastle::Settings::axisIndicator(ledManager.getAxisIndicator()));
 
             // レンダリングタスク開始 (Core 1)
             if (!ledManager.startRenderTask(1, 2, 8192)) {
@@ -258,7 +272,7 @@ void setup() {
             sastle::Log.println("SoloPlayer initialization failed");
         }
         if (network.isSoftAP()) {
-            if (!soloWeb.begin(config, soloPlayer, ledManager, network, config.getSoloHttpPort())) {
+            if (!soloWeb.begin(config, soloPlayer, ledManager, network, imuSensor, config.getSoloHttpPort())) {
                 sastle::Log.println("Web server failed to start");
             }
         }
@@ -360,11 +374,29 @@ void loop() {
         unsigned long nowR = millis();
         if (nowR - s_lastRate >= 5000) {
             uint32_t rt = imuSensor.debugReadTotal(), rf = imuSensor.debugReadFails(),
-                     rd = imuSensor.debugDiscards();
-            float dt = (nowR - s_lastRate) * 0.001f;
-            sastle::Log.printf("[RATE] loop=%.0f/s imu_read=%.0f/s fail=%.0f/s disc=%.0f/s\n",
-                               s_loops / dt, (rt - s_pReads) / dt,
-                               (rf - s_pFails) / dt, (rd - s_pDisc) / dt);
+                     rd = imuSensor.debugDiscards(), rz = imuSensor.debugZeroReads(),
+                     rp = imuSensor.debugPartialReads(), rs = imuSensor.debugStraddles();
+            static uint32_t pRz = 0, pRp = 0, pRs = 0;
+            const float dtR = (nowR - s_lastRate) * 0.001f;
+            sastle::Log.printf("[RATE] loop=%.0f/s imu_read=%.0f/s fail=%.0f/s disc=%.0f/s zero=%.0f/s partial=%.0f/s straddle=%.0f/s "
+                               "i2c=%lukHz word=%d smooth=%u seq=%lu\n",
+                               s_loops / dtR,
+                               (rt - s_pReads) / dtR, (rf - s_pFails) / dtR, (rd - s_pDisc) / dtR, (rz - pRz) / dtR,
+                               (rp - pRp) / dtR, (rs - pRs) / dtR,
+                               (unsigned long)(imuSensor.i2cClock() / 1000), imuSensor.wordRead() ? 1 : 0,
+                               (unsigned)imuSensor.smoothFrames(), (unsigned long)imuSensor.quatSeq());
+            pRz = rz; pRp = rp; pRs = rs;
+            // IMU タスクが退避した診断スナップショットをここで吐く (タスク側は Log を呼ばない)
+            {
+                uint8_t raw[8]; float n2; uint8_t reg; uint32_t hz; bool okR, autoR;
+                if (imuSensor.takeDiagClockChanged(hz)) sastle::Log.printf("[IMU] I2C clock -> %lu kHz\n", (unsigned long)(hz / 1000));
+                if (imuSensor.takeDiagReset(okR, autoR)) sastle::Log.printf("[IMU] sensor re-init (%s) %s\n", autoR ? "AUTO: discard ratio >50% for 4s" : "manual", okR ? "OK" : "FAILED");
+                if (imuSensor.takeDiagReadFail(raw)) sastle::Log.printf("[IMU] quat read failed, raw=%02X %02X %02X %02X %02X %02X %02X %02X\n", raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
+                if (imuSensor.takeDiagDiscard(raw, n2)) sastle::Log.printf("[IMU] Discarded quat |q|^2=%.3f raw=%02X%02X %02X%02X %02X%02X %02X%02X\n", n2, raw[1], raw[0], raw[3], raw[2], raw[5], raw[4], raw[7], raw[6]);
+                if (imuSensor.takeDiagVecPartial(reg, raw)) sastle::Log.printf("[IMU] vec reg=0x%02X partial raw=%02X%02X %02X%02X %02X%02X\n", reg, raw[1], raw[0], raw[3], raw[2], raw[5], raw[4]);
+                static char dumpHex[200]; uint16_t idx0;
+                for (int k = 0; k < 3 && imuSensor.takeRawDumpLine(dumpHex, sizeof(dumpHex), idx0); k++) sastle::Log.printf("[DUMP] %u %s\n", (unsigned)idx0, dumpHex);
+            }
             s_loops = 0; s_pReads = rt; s_pFails = rf; s_pDisc = rd;
             s_lastRate = nowR;
         }
@@ -424,7 +456,9 @@ void loop() {
     // IMU更新
     unsigned long now = millis();
     if (imuSensor.isInitialized()) {
-        imuSensor.update();
+        if (!imuSensor.taskHandle()) {
+            imuSensor.update();   // タスク起動に失敗したときだけ loop で読む
+        }
 
         // ジェスチャー検出更新
         gesture.update();

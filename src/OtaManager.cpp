@@ -1,6 +1,7 @@
 #include "OtaManager.h"
 #include "Log.h"
 #include "LEDManager.h"
+#include "SoloPlayer.h"
 
 #include <ArduinoOTA.h>
 
@@ -14,8 +15,9 @@ constexpr const char* kOtaHostname = "isolation-sphere";
 constexpr const char* kOtaPassword = "isolation-sphere-ota";
 }
 
-bool OtaManager::begin(LEDManager* led) {
+bool OtaManager::begin(LEDManager* led, SoloPlayer* player) {
     _led = led;
+    _player = player;
 
     ArduinoOTA.setHostname(kOtaHostname);
     ArduinoOTA.setPassword(kOtaPassword);
@@ -23,7 +25,14 @@ bool OtaManager::begin(LEDManager* led) {
     ArduinoOTA.onStart([this]() {
         const bool isFs = (ArduinoOTA.getCommand() == U_SPIFFS);
         Log.printf("\n[OTA] Start: %s update\n", isFs ? "filesystem" : "firmware");
-        // 描画タスクを止めて Core1 / フラッシュアクセスを解放する
+        // 再生を先に止める。再生中は Core0 が 100ms 中 60ms をデコードに使い、
+        // LittleFS も読み続けるため、OTA の受信とフラッシュ書き込みが間に合わない
+        // (実機で転送 0% のまま失敗した)。
+        if (_player) {
+            _player->stop();
+        }
+        // 描画タスクを止めて Core1 とフラッシュ操作ロックを解放する。
+        // stopRenderTask() は協調停止 (show() の途中で殺さない) であること。
         if (_led) {
             _led->stopRenderTask();
             _led->fillSolid(0, 0, 0);

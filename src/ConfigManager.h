@@ -185,6 +185,9 @@ public:
     /// 既定 false: iOS の CNA はファイル選択ダイアログが出ないため動画をアップロードできない。
     /// false のときは OS の検出プローブに期待どおりの応答を返し、CNA を開かせない。
     bool getSoloCaptivePortal() { return doc["solo"]["captive_portal"] | false; }
+    /// IMU 姿勢の移動平均フレーム数 (1 = 平滑なし、上限 IMUManager::kSmoothMax)。
+    /// 派生元の実機評価では 10。/api/imu {"smooth_frames": N} で実行時にも変更できる。
+    uint8_t getImuSmoothFrames() { return doc["imu"]["smooth_frames"] | 1; }
     bool getOpeningActionEnabled() { return doc["system"]["opening_action"]["enabled"] | true; }
     uint16_t getOpeningActionDurationMs() { return doc["system"]["opening_action"]["duration_ms"] | 1200; }
     

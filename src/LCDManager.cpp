@@ -186,25 +186,34 @@ void LCDManager::drawQr(const char* qrText, const char* line1, const char* line2
         _statusCanvas->createSprite(_lcdWidth, _lcdHeight);
     }
     M5Canvas& c = *_statusCanvas;
-    c.fillSprite(TFT_WHITE);  // QR は白地に黒が読み取りやすい
 
-    // バイトモード / 誤り訂正 L の容量: v3=53, v4=78, v5=106, v6=134 文字
-    const size_t len = strlen(qrText);
-    uint8_t version = 3;
-    if (len > 106)     version = 6;
-    else if (len > 78) version = 5;
-    else if (len > 53) version = 4;
+    // QR 生成 (c.qrcode) は 50〜70ms かかり、500ms ごとに loopTask を止めていた
+    // (実機 2026-09-23: IMU の読み出しに 75ms の穴が 500ms 周期で入っていた)。
+    // 内容が変わったときだけ描き直し、それ以外は生存表示の点だけ更新する。
+    static String s_lastKey;
+    const String key = String(qrText) + "\n" + (line1 ? line1 : "") + "\n" + (line2 ? line2 : "");
+    if (key != s_lastKey) {
+        s_lastKey = key;
+        c.fillSprite(TFT_WHITE);  // QR は白地に黒が読み取りやすい
 
-    // 128x128 のうち上 104px を QR に使い、下に SSID / URL を小さく出す
-    const int32_t qrSize = 100;
-    c.qrcode(qrText, (_lcdWidth - qrSize) / 2, 2, qrSize, version);
+        // バイトモード / 誤り訂正 L の容量: v3=53, v4=78, v5=106, v6=134 文字
+        const size_t len = strlen(qrText);
+        uint8_t version = 3;
+        if (len > 106)     version = 6;
+        else if (len > 78) version = 5;
+        else if (len > 53) version = 4;
 
-    c.setTextSize(1);
-    c.setTextColor(TFT_BLACK);
-    c.setCursor(4, 106);
-    c.print(line1 ? line1 : "");
-    c.setCursor(4, 117);
-    c.print(line2 ? line2 : "");
+        // 128x128 のうち上 104px を QR に使い、下に SSID / URL を小さく出す
+        const int32_t qrSize = 100;
+        c.qrcode(qrText, (_lcdWidth - qrSize) / 2, 2, qrSize, version);
+
+        c.setTextSize(1);
+        c.setTextColor(TFT_BLACK);
+        c.setCursor(4, 106);
+        c.print(line1 ? line1 : "");
+        c.setCursor(4, 117);
+        c.print(line2 ? line2 : "");
+    }
     // 生存表示 (点滅)
     c.fillCircle(_lcdWidth - 6, _lcdHeight - 6, 3, _heartbeat ? TFT_GREEN : TFT_WHITE);
 

@@ -13,23 +13,37 @@ namespace sastle {
 namespace {
 constexpr const char* kNamespace = "solo";   // STA 資格情報と同じ namespace
 constexpr const char* kKeyBrightness = "bri";
+constexpr const char* kKeyAxis = "axis";
+constexpr const char* kKeySmooth = "smooth";
 
 bool s_ready = false;
 bool s_dirty = false;
 uint32_t s_dirtyAtMs = 0;
 uint8_t s_brightness = 0;
 bool s_hasBrightness = false;
+bool s_axis = false;
+bool s_hasAxis = false;
+uint8_t s_smooth = 1;
+bool s_hasSmooth = false;
 
 /// 1 回だけ開いて読み、以降は RAM 上の値で応答する
-void writeBrightness(uint8_t percent) {
+void writeAll() {
     Preferences prefs;
     if (!prefs.begin(kNamespace, false)) {
-        Serial.println("[Settings] NVS open failed (brightness not saved)");
+        Serial.println("[Settings] NVS open failed (settings not saved)");
         return;
     }
-    prefs.putUChar(kKeyBrightness, percent);
+    if (s_hasBrightness) {
+        prefs.putUChar(kKeyBrightness, s_brightness);
+    }
+    if (s_hasAxis) {
+        prefs.putBool(kKeyAxis, s_axis);
+    }
+    if (s_hasSmooth) {
+        prefs.putUChar(kKeySmooth, s_smooth);
+    }
     prefs.end();
-    Serial.printf("[Settings] saved brightness=%u%%\n", (unsigned)percent);
+    Serial.printf("[Settings] saved brightness=%u%% axis=%d\n", (unsigned)s_brightness, s_axis ? 1 : 0);
 }
 }  // namespace
 
@@ -39,6 +53,14 @@ void Settings::begin() {
         Serial.println("[Settings] NVS not available (using config.json defaults)");
         s_ready = true;  // 読めなくても動作は継続する
         return;
+    }
+    if (prefs.isKey(kKeySmooth)) {
+        s_smooth = prefs.getUChar(kKeySmooth, 1);
+        s_hasSmooth = true;
+    }
+    if (prefs.isKey(kKeyAxis)) {
+        s_axis = prefs.getBool(kKeyAxis, false);
+        s_hasAxis = true;
     }
     if (prefs.isKey(kKeyBrightness)) {
         s_brightness = prefs.getUChar(kKeyBrightness, 50);
@@ -50,7 +72,7 @@ void Settings::begin() {
     prefs.end();
     s_ready = true;
     if (s_hasBrightness) {
-        Serial.printf("[Settings] restored brightness=%u%%\n", (unsigned)s_brightness);
+        Serial.printf("[Settings] restored brightness=%u%% axis=%d\n", (unsigned)s_brightness, s_axis ? 1 : 0);
     } else {
         Serial.println("[Settings] no saved settings yet (using config.json defaults)");
     }
@@ -58,6 +80,34 @@ void Settings::begin() {
 
 uint8_t Settings::brightness(uint8_t fallback) {
     return s_hasBrightness ? s_brightness : fallback;
+}
+
+uint8_t Settings::imuSmoothFrames(uint8_t fallback) {
+    return s_hasSmooth ? s_smooth : fallback;
+}
+
+void Settings::setImuSmoothFrames(uint8_t n) {
+    if (s_hasSmooth && s_smooth == n) {
+        return;
+    }
+    s_smooth = n;
+    s_hasSmooth = true;
+    s_dirty = true;
+    s_dirtyAtMs = millis();
+}
+
+bool Settings::axisIndicator(bool fallback) {
+    return s_hasAxis ? s_axis : fallback;
+}
+
+void Settings::setAxisIndicator(bool enabled) {
+    if (s_hasAxis && s_axis == enabled) {
+        return;
+    }
+    s_axis = enabled;
+    s_hasAxis = true;
+    s_dirty = true;
+    s_dirtyAtMs = millis();
 }
 
 void Settings::setBrightness(uint8_t percent) {
@@ -81,7 +131,7 @@ void Settings::tick() {
         return;  // まだ操作中かもしれないので待つ
     }
     s_dirty = false;
-    writeBrightness(s_brightness);
+    writeAll();
 }
 
 void Settings::flush() {
@@ -89,7 +139,7 @@ void Settings::flush() {
         return;
     }
     s_dirty = false;
-    writeBrightness(s_brightness);
+    writeAll();
 }
 
 }  // namespace sastle

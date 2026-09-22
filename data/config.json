@@ -34,6 +34,9 @@
     "format": "RGB565",
     "type": "JPEG"
   },
+  "imu": {
+    "smooth_frames": 10
+  },
   "led": {
     "multisample": {
       "enabled": true,

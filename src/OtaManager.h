@@ -18,6 +18,7 @@
 namespace sastle {
 
 class LEDManager;  // 前方宣言
+class SoloPlayer;  // 前方宣言
 
 class OtaManager {
 public:
@@ -26,7 +27,7 @@ public:
      * @param led OTA 開始時にレンダリングタスクを止めるための参照 (nullptr 可)
      * @return true 初期化成功
      */
-    bool begin(LEDManager* led);
+    bool begin(LEDManager* led, SoloPlayer* player = nullptr);
 
     /**
      * @brief OTA 要求を処理する (メインループから毎回呼ぶ)
@@ -37,6 +38,7 @@ public:
 
 private:
     bool _started = false;
+    SoloPlayer* _player = nullptr;
     LEDManager* _led = nullptr;
 };
 

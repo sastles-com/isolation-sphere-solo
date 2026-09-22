@@ -183,6 +183,8 @@ public:
      * @note 実際にテスト描画を始めるには setOutputMode(OutputMode::Test) が必要。
      */
     void setTestPattern(TestPattern pattern, uint8_t width);
+    TestPattern getTestPattern() const { return _testPattern; }
+    uint8_t getTestWidth() const { return _testWidth; }
 
     /**
      * @brief LEDを即座に更新
@@ -344,6 +346,7 @@ private:
     // メンバー変数
     bool _initialized;               ///< 初期化フラグ
     bool _taskRunning;               ///< タスク実行フラグ
+    volatile bool _stopRequested = false;  ///< 協調停止の要求 (show() の途中で殺さないため)
     
     ConfigManager* _config;          ///< 設定マネージャーへのポインタ
     ImageManager* _imageManager;     ///< 画像マネージャーへのポインタ

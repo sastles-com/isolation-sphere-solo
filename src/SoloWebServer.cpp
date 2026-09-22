@@ -9,6 +9,7 @@
 
 #include "ConvertPage.h"
 #include "Settings.h"
+#include <Wire.h>
 #include <LittleFS.h>
 #include <string.h>
 
@@ -77,6 +78,25 @@ small{color:#888}#msg{min-height:1.2em;color:#f5b041;font-size:14px;word-break:b
  <div class="row"><button id="del" class="warn">保存済み動画を削除</button></div>
 </div>
 <div class="card">
+ <div class="k">IMU (姿勢センサー)</div>
+ <div class="row"><span class="k">状態</span><span id="i_st" class="v">-</span></div>
+ <div class="row"><span class="k">quaternion</span><span id="i_q" class="v">-</span></div>
+ <div class="row"><span class="k">読み出し</span><span id="i_rd" class="v">-</span></div>
+ <div class="row"><span class="k">平滑 (フレーム)</span><span id="i_smv" class="v">-</span></div>
+ <input id="i_sm" type="range" min="1" max="50" step="1">
+ <div class="row"><button id="i_reset" class="gray">IMU を再初期化</button></div>
+ <p><small>cal は BNO055 のキャリブレーション (sys/gyro/accel/mag、各 0-3)。fail = I2C 失敗、disc = 化け値の破棄、partial = 上位バイト欠落を検出して読み直した回数、straddle = 融合更新をまたいだ読みを検出した回数。これらが増えるのは<b>正常に検出できている</b>証拠で、姿勢に出なければ問題ありません。平滑は移動平均のフレーム数 (1 = なし。大きいほど滑らかだが遅れる)。</small></p>
+</div>
+<div class="card">
+ <div class="k">表示パターン (配線・向きの確認用)</div>
+ <div class="row"><button id="m_sphere">映像</button><button id="m_test" class="gray">テストパターン</button></div>
+ <div class="row"><button id="p_strip" class="gray">ストリップ識別色</button><button id="p_chase" class="gray">チェイス</button></div>
+ <div class="row"><span class="k">チェイス幅</span><span id="wval" class="v">-</span></div>
+ <input id="w" type="range" min="1" max="20" step="1">
+ <div class="row"><button id="axis" class="gray">XYZ軸を重ねる</button></div>
+ <p><small>ストリップ識別色は 5 本の配線の同定と全点灯確認、チェイスは LED の並び順と向きの確認に使います。XYZ軸は映像に重ねて表示し、IMU が有効なら球体を回しても軸は空間に固定されて見えます (±X=赤 / ±Y=緑 / ±Z=青、マイナス側は暗色)。</small></p>
+</div>
+<div class="card">
  <div class="k">LAN 接続 (開発用 / 任意)</div>
  <p><small>普段の Wi-Fi にも同時接続します。PC の Wi-Fi を切り替えずに OTA 書き込みができるようになります。SSID を空で保存すると無効化します。反映は再起動後です。</small></p>
  <input id="ssid" type="text" placeholder="SSID" autocapitalize="off" autocorrect="off" spellcheck="false">
@@ -91,7 +111,7 @@ small{color:#888}#msg{min-height:1.2em;color:#f5b041;font-size:14px;word-break:b
 <script>
 const $=id=>document.getElementById(id);
 const fmt=n=>n>=1048576?(n/1048576).toFixed(2)+' MB':n>=1024?(n/1024).toFixed(1)+' KB':n+' B';
-let busy=false,briTimer=null;
+let busy=false,briTimer=null,wTimer=null,smTimer=null,ledAxis=false;
 async function api(p,body){const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):'{}'});const j=await r.json().catch(()=>({}));if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
 const say=t=>{$('msg').textContent=t};
 async function refresh(){if(busy)return;try{const r=await fetch('/api/status',{cache:'no-store'});const s=await r.json();
@@ -101,6 +121,17 @@ async function refresh(){if(busy)return;try{const r=await fetch('/api/status',{c
  $('fs').textContent=`${fmt(s.fs.free)} (最大 ${fmt(s.fs.max_upload)})`;
  if(document.activeElement!==$('bri')){$('bri').value=s.brightness;$('bval').textContent=s.brightness+'%'}
  $('dev').textContent=`${s.device} / AP ${s.ap.ssid} (${s.ap.clients}) / up ${s.uptime_s}s`;
+ if(s.imu){const I=s.imu;
+  $('i_st').textContent=I.ok?`OK mode=${I.mode} cal=${I.cal}`:'無効 (未検出)';
+  $('i_q').textContent=I.quat.map(x=>x.toFixed(3)).join(' ');
+  $('i_rd').textContent=`${I.reads} / fail ${I.fails} / disc ${I.discards} / partial ${I.partial} / straddle ${I.straddle}`;
+  if(document.activeElement!==$('i_sm')){$('i_sm').value=I.smooth;$('i_smv').textContent=I.smooth}}
+ if(s.led){const L=s.led;ledAxis=L.axis;
+  const sel=(id,on)=>$(id).className=on?'':'gray';
+  sel('m_sphere',L.mode==='sphere');sel('m_test',L.mode==='test');
+  sel('p_strip',L.pattern==='strip');sel('p_chase',L.pattern==='chase');
+  sel('axis',L.axis);$('axis').textContent=L.axis?'XYZ軸を重ねる (ON)':'XYZ軸を重ねる';
+  if(document.activeElement!==$('w')){$('w').value=L.width;$('wval').textContent=L.width}}
  if(s.sta){$('sta').textContent=!s.sta.enabled?'未設定':(s.sta.connected?`${s.sta.ssid} ${s.sta.ip}`:`${s.sta.ssid} 接続中…`);
   if(document.activeElement!==$('ssid')&&!$('ssid').value&&s.sta.ssid)$('ssid').placeholder=s.sta.ssid}
  $('play').disabled=!(s.state==='stopped'||s.state==='paused');$('pause').disabled=s.state!=='playing';$('stop').disabled=!(s.state==='playing'||s.state==='paused');
@@ -111,8 +142,17 @@ $('play').onclick=()=>api('/api/play').then(refresh).catch(e=>say(e.message));
 $('stop').onclick=()=>api('/api/stop').then(refresh).catch(e=>say(e.message));
 $('pause').onclick=()=>api('/api/pause').then(refresh).catch(e=>say(e.message));
 $('bri').oninput=e=>{$('bval').textContent=e.target.value+'%';clearTimeout(briTimer);briTimer=setTimeout(()=>api('/api/brightness',{value:+e.target.value}).catch(e=>say(e.message)),150)};
+const led=b=>api('/api/led',b).then(refresh).catch(e=>say(e.message));
+$('m_sphere').onclick=()=>led({mode:'sphere'});
+$('m_test').onclick=()=>led({mode:'test'});
+$('p_strip').onclick=()=>led({pattern:'strip'});
+$('p_chase').onclick=()=>led({pattern:'chase'});
+$('axis').onclick=()=>led({axis:!ledAxis});
+$('w').oninput=e=>{$('wval').textContent=e.target.value;clearTimeout(wTimer);wTimer=setTimeout(()=>led({width:+e.target.value}),250)};
 $('del').onclick=()=>{if(confirm('保存済み動画を削除しますか？'))api('/api/video/delete').then(refresh).catch(e=>say(e.message))};
 $('reboot').onclick=()=>{if(confirm('再起動しますか？'))api('/api/reboot').then(()=>say('再起動中…')).catch(e=>say(e.message))};
+$('i_sm').oninput=e=>{$('i_smv').textContent=e.target.value;clearTimeout(smTimer);smTimer=setTimeout(()=>api('/api/imu',{smooth_frames:+e.target.value}).then(refresh).catch(e=>say(e.message)),250)};
+$('i_reset').onclick=()=>{if(confirm('IMU (BNO055) を再初期化しますか？'))api('/api/imu',{reset:true}).then(()=>say('IMU を再初期化しました')).catch(e=>say(e.message))};
 $('wifi').onclick=()=>{const sd=$('ssid').value.trim();
  if(!sd&&!confirm('SSID が空です。LAN 接続を無効にしますか？'))return;
  api('/api/wifi',{ssid:sd,password:$('pass').value}).then(j=>{$('pass').value='';say(sd?`保存しました (${j.ssid})。再起動後に接続します`:'LAN 接続を無効にしました')}).catch(e=>say(e.message))};
@@ -131,6 +171,7 @@ SoloWebServer::SoloWebServer()
       _player(nullptr),
       _led(nullptr),
       _net(nullptr),
+      _imu(nullptr),
       _rxBuf(nullptr),
       _brightnessPct(50),
       _rebootAtMs(0),
@@ -148,7 +189,7 @@ SoloWebServer::~SoloWebServer() {
 }
 
 bool SoloWebServer::begin(ConfigManager& config, SoloPlayer& player, LEDManager& led,
-                          NetworkManager& net, uint16_t port) {
+                          NetworkManager& net, IMUManager& imu, uint16_t port) {
     if (_server) {
         return true;
     }
@@ -156,6 +197,7 @@ bool SoloWebServer::begin(ConfigManager& config, SoloPlayer& player, LEDManager&
     _player = &player;
     _led = &led;
     _net = &net;
+    _imu = &imu;
     // 利用者が UI で変えた値 (NVS) を優先し、無ければ config.json の既定値を使う
     _brightnessPct = Settings::brightness(config.getParamBrightness());
 
@@ -192,6 +234,9 @@ bool SoloWebServer::begin(ConfigManager& config, SoloPlayer& player, LEDManager&
         {"/api/stop",         HTTP_POST, onStop,       this, false, false, nullptr},
         {"/api/pause",        HTTP_POST, onPause,      this, false, false, nullptr},
         {"/api/wifi",         HTTP_POST, onWifi,       this, false, false, nullptr},
+        {"/api/led",          HTTP_POST, onLed,        this, false, false, nullptr},
+        {"/api/imu",          HTTP_GET,  onImuGet,     this, false, false, nullptr},
+        {"/api/imu",          HTTP_POST, onImuPost,    this, false, false, nullptr},
         {"/api/brightness",   HTTP_POST, onBrightness, this, false, false, nullptr},
         {"/api/video",        HTTP_POST, onUpload,     this, false, false, nullptr},
         {"/api/video/delete", HTTP_POST, onDelete,     this, false, false, nullptr},
@@ -334,6 +379,17 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
     const size_t maxUpload = self->maxUploadBytes(fsFree, existing);
     const char* err = p.lastError();
 
+    // IMU 診断: 姿勢追従が止まる/化ける問題の切り分け用。シリアルが使えない
+    // (組み立て後は USB 給電で再生すると電源が落ちる) ため UI から見えるようにする。
+    bool imuOk = false;
+    uint8_t imuMode = 0, calSys = 0, calGyro = 0, calAccel = 0, calMag = 0;
+    float iqw = 0.0f, iqx = 0.0f, iqy = 0.0f, iqz = 0.0f;
+    if (self->_imu && self->_imu->isInitialized()) {
+        imuOk = self->_imu->getQuaternion(iqw, iqx, iqy, iqz);
+        imuMode = self->_imu->getOperationMode();
+        self->_imu->getCalibration(calSys, calGyro, calAccel, calMag);
+    }
+
     // error は静的ASCII文字列のみ (エスケープ不要)
     int n = snprintf(self->_jsonBuf, sizeof(self->_jsonBuf),
         "{\"device\":\"%s\",\"state\":\"%s\",\"error\":%s%s%s,"
@@ -345,6 +401,9 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
         "\"fs\":{\"total\":%u,\"used\":%u,\"free\":%u,\"max_upload\":%u},"
         "\"ap\":{\"ssid\":\"%s\",\"ip\":\"%s\",\"clients\":%u},"
         "\"sta\":{\"enabled\":%s,\"connected\":%s,\"ssid\":\"%s\",\"ip\":\"%s\"},"
+        "\"led\":{\"mode\":\"%s\",\"pattern\":\"%s\",\"width\":%u,\"axis\":%s},"
+        "\"imu\":{\"ok\":%s,\"mode\":%u,\"cal\":\"%u%u%u%u\","
+        "\"quat\":[%.3f,%.3f,%.3f,%.3f],\"reads\":%u,\"fails\":%u,\"discards\":%u,\"partial\":%u,\"straddle\":%u,\"seq\":%u,\"smooth\":%u},"
         "\"uploads\":%u,\"upload_failures\":%u,"
         "\"uptime_s\":%lu,\"heap_free\":%u,\"psram_free\":%u}",
         self->_config->getSphereID().c_str(), p.stateName(),
@@ -364,6 +423,21 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
         self->_net && self->_net->staConnected() ? "true" : "false",
         self->_net ? self->_net->staSsid().c_str() : "",
         self->_net && self->_net->staConnected() ? WiFi.localIP().toString().c_str() : "",
+        self->_led->getOutputMode() == LEDManager::OutputMode::Test ? "test"
+            : (self->_led->getOutputMode() == LEDManager::OutputMode::Manual ? "manual" : "sphere"),
+        self->_led->getTestPattern() == LEDManager::TestPattern::Chase ? "chase" : "strip",
+        (unsigned)self->_led->getTestWidth(),
+        self->_led->getAxisIndicator() ? "true" : "false",
+        imuOk ? "true" : "false", (unsigned)imuMode,
+        (unsigned)calSys, (unsigned)calGyro, (unsigned)calAccel, (unsigned)calMag,
+        iqw, iqx, iqy, iqz,
+        (unsigned)(self->_imu ? self->_imu->debugReadTotal() : 0),
+        (unsigned)(self->_imu ? self->_imu->debugReadFails() : 0),
+        (unsigned)(self->_imu ? self->_imu->debugDiscards() : 0),
+        (unsigned)(self->_imu ? self->_imu->debugPartialReads() : 0),
+        (unsigned)(self->_imu ? self->_imu->debugStraddles() : 0),
+        (unsigned)(self->_imu ? self->_imu->quatSeq() : 0),
+        (unsigned)(self->_imu ? self->_imu->smoothFrames() : 0),
         (unsigned)self->_uploads, (unsigned)self->_uploadFailures,
         (unsigned long)(millis() / 1000), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
     if (n < 0 || (size_t)n >= sizeof(self->_jsonBuf)) {
@@ -427,6 +501,145 @@ esp_err_t SoloWebServer::onWifi(httpd_req_t* req) {
     }
     snprintf(self->_jsonBuf, sizeof(self->_jsonBuf),
              "{\"ok\":true,\"ssid\":\"%s\",\"note\":\"reboot to apply\"}", ssid);
+    return self->sendJson(req, "200 OK", self->_jsonBuf);
+}
+
+esp_err_t SoloWebServer::onLed(httpd_req_t* req) {
+    auto* self = static_cast<SoloWebServer*>(req->user_ctx);
+    char body[160];
+    size_t len = 0;
+    if (!self->readBody(req, body, sizeof(body), len)) {
+        return self->sendError(req, "400 Bad Request", "invalid body");
+    }
+    StaticJsonDocument<192> doc;
+    if (deserializeJson(doc, body, len) != DeserializationError::Ok) {
+        return self->sendError(req, "400 Bad Request", "invalid json");
+    }
+
+    // 指定されたキーだけを反映する (mode / pattern / width / axis はそれぞれ独立)
+    if (doc.containsKey("mode")) {
+        const char* m = doc["mode"] | "";
+        if (strcmp(m, "sphere") == 0) {
+            self->_led->setOutputMode(LEDManager::OutputMode::Sphere);
+        } else if (strcmp(m, "test") == 0) {
+            self->_led->setOutputMode(LEDManager::OutputMode::Test);
+        } else {
+            return self->sendError(req, "400 Bad Request", "mode must be sphere or test");
+        }
+    }
+    if (doc.containsKey("pattern") || doc.containsKey("width")) {
+        const char* pat = doc["pattern"] | (self->_led->getTestPattern() == LEDManager::TestPattern::Chase ? "chase" : "strip");
+        int w = doc["width"] | (int)self->_led->getTestWidth();
+        if (w < 1 || w > 60) {
+            return self->sendError(req, "400 Bad Request", "width out of range (1-60)");
+        }
+        if (strcmp(pat, "strip") == 0) {
+            self->_led->setTestPattern(LEDManager::TestPattern::StripId, (uint8_t)w);
+        } else if (strcmp(pat, "chase") == 0) {
+            self->_led->setTestPattern(LEDManager::TestPattern::Chase, (uint8_t)w);
+        } else {
+            return self->sendError(req, "400 Bad Request", "pattern must be strip or chase");
+        }
+    }
+    if (doc.containsKey("axis")) {
+        const bool on = doc["axis"] | false;
+        self->_led->setAxisIndicator(on);
+        Settings::setAxisIndicator(on);  // 次回起動でも復元する
+    }
+
+    snprintf(self->_jsonBuf, sizeof(self->_jsonBuf),
+             "{\"ok\":true,\"mode\":\"%s\",\"pattern\":\"%s\",\"width\":%u,\"axis\":%s}",
+             self->_led->getOutputMode() == LEDManager::OutputMode::Test ? "test" : "sphere",
+             self->_led->getTestPattern() == LEDManager::TestPattern::Chase ? "chase" : "strip",
+             (unsigned)self->_led->getTestWidth(),
+             self->_led->getAxisIndicator() ? "true" : "false");
+    return self->sendJson(req, "200 OK", self->_jsonBuf);
+}
+
+// IMU 診断 (GET): カウンタ・キャリブレーション・設定。?dump=1 で imu_dump の生サンプル
+// (12B/サンプル hex、8 サンプル/行) を溜まっている分だけ返す。
+esp_err_t SoloWebServer::onImuGet(httpd_req_t* req) {
+    auto* self = static_cast<SoloWebServer*>(req->user_ctx);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    if (!self->_imu || !self->_imu->isInitialized()) {
+        return httpd_resp_send(req, "{\"ok\":false,\"error\":\"imu not initialized\"}", HTTPD_RESP_USE_STRLEN);
+    }
+    IMUManager& imu = *self->_imu;
+    uint8_t cs = 0, cg = 0, ca = 0, cm = 0;
+    imu.getCalibration(cs, cg, ca, cm);
+    float w = 0, x = 0, y = 0, z = 0;
+    imu.getQuaternion(w, x, y, z);
+    int len = snprintf(self->_jsonBuf, sizeof(self->_jsonBuf),
+        "{\"ok\":true,\"now\":%lu,\"i2c_khz\":%lu,\"word_read\":%s,\"aux\":%s,\"smooth\":%u,\"mode\":%u,"
+        "\"cal\":\"%u%u%u%u\",\"quat\":[%.4f,%.4f,%.4f,%.4f],\"seq\":%lu,"
+        "\"reads\":%u,\"fails\":%u,\"discards\":%u,\"zero\":%u,\"partial\":%u,\"straddle\":%u",
+        (unsigned long)millis(), (unsigned long)(imu.i2cClock() / 1000), imu.wordRead() ? "true" : "false",
+        imu.auxReads() ? "true" : "false", (unsigned)imu.smoothFrames(), (unsigned)imu.getOperationMode(),
+        cs, cg, ca, cm, w, x, y, z, (unsigned long)imu.quatSeq(),
+        (unsigned)imu.debugReadTotal(), (unsigned)imu.debugReadFails(), (unsigned)imu.debugDiscards(),
+        (unsigned)imu.debugZeroReads(), (unsigned)imu.debugPartialReads(), (unsigned)imu.debugStraddles());
+    httpd_resp_send_chunk(req, self->_jsonBuf, len);
+    char q[16];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK && strstr(q, "dump=1")) {
+        httpd_resp_send_chunk(req, ",\"dump\":[", HTTPD_RESP_USE_STRLEN);
+        static char hex[200];
+        uint16_t idx0 = 0;
+        for (int k = 0; k < 250 && imu.takeRawDumpLine(hex, sizeof(hex), idx0); k++) {
+            len = snprintf(self->_jsonBuf, sizeof(self->_jsonBuf), "%s[%u,\"%s\"]", k ? "," : "", (unsigned)idx0, hex);
+            httpd_resp_send_chunk(req, self->_jsonBuf, len);
+        }
+        httpd_resp_send_chunk(req, "]", 1);
+    }
+    httpd_resp_send_chunk(req, "}", 1);
+    return httpd_resp_send_chunk(req, nullptr, 0);
+}
+
+// IMU 操作 (POST): {"smooth_frames":1..50} {"reset":true} {"i2c_khz":50..400}
+//                  {"aux":bool} {"word_read":bool} {"dump":N (<=2000 サンプルを PSRAM に記録)}
+esp_err_t SoloWebServer::onImuPost(httpd_req_t* req) {
+    auto* self = static_cast<SoloWebServer*>(req->user_ctx);
+    if (!self->_imu || !self->_imu->isInitialized()) {
+        return self->sendError(req, "409 Conflict", "imu not initialized");
+    }
+    char body[160];
+    size_t len = 0;
+    if (!self->readBody(req, body, sizeof(body), len)) {
+        return self->sendError(req, "400 Bad Request", "invalid body");
+    }
+    StaticJsonDocument<192> doc;
+    if (deserializeJson(doc, body, len) != DeserializationError::Ok) {
+        return self->sendError(req, "400 Bad Request", "invalid json");
+    }
+    IMUManager& imu = *self->_imu;
+    if (doc.containsKey("smooth_frames")) {
+        const int n = doc["smooth_frames"] | 1;
+        if (n < 1 || n > (int)IMUManager::kSmoothMax) {
+            return self->sendError(req, "400 Bad Request", "smooth_frames out of range");
+        }
+        imu.setSmoothFrames((uint8_t)n);
+        Settings::setImuSmoothFrames((uint8_t)n);   // 再起動後も維持する
+    }
+    if (doc.containsKey("i2c_khz")) {
+        const int khz = doc["i2c_khz"] | 100;
+        if (khz < 50 || khz > 400) {   // 10kHz 指定で core1 が飢餓した事故があるため下限 50
+            return self->sendError(req, "400 Bad Request", "i2c_khz out of range (50-400)");
+        }
+        imu.setI2cClock((uint32_t)khz * 1000);
+    }
+    if (doc.containsKey("aux")) imu.setAuxReads(doc["aux"] | true);
+    if (doc.containsKey("word_read")) imu.setWordRead(doc["word_read"] | true);
+    if (doc.containsKey("reset") && (doc["reset"] | false)) imu.requestReset();
+    if (doc.containsKey("dump")) {
+        const int n = doc["dump"] | 0;
+        if (n < 1 || n > 2000 || !imu.startRawDump((uint16_t)n)) {
+            return self->sendError(req, "400 Bad Request", "dump must be 1-2000 (or PSRAM alloc failed)");
+        }
+    }
+    snprintf(self->_jsonBuf, sizeof(self->_jsonBuf),
+             "{\"ok\":true,\"smooth\":%u,\"i2c_khz\":%lu,\"aux\":%s,\"word_read\":%s}",
+             (unsigned)imu.smoothFrames(), (unsigned long)(imu.i2cClock() / 1000),
+             imu.auxReads() ? "true" : "false", imu.wordRead() ? "true" : "false");
     return self->sendJson(req, "200 OK", self->_jsonBuf);
 }
 
