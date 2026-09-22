@@ -35,7 +35,7 @@
     "type": "JPEG"
   },
   "imu": {
-    "smooth_frames": 10
+    "smooth_frames": 1
   },
   "led": {
     "multisample": {
