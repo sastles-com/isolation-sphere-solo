@@ -180,6 +180,20 @@ public:
     uint32_t debugPartialReads() const { return _cnt.partialReads; }
     /// 4 ワード読みの途中で融合更新をまたいだ (w の再読みが不一致) と判定して読み直した回数
     uint32_t debugStraddles() const { return _cnt.straddles; }
+
+    /// 診断: 1 周期の内訳 [us]。update = _updateOnce() の実時間、cycle = 起床間隔。
+    /// 40/s しか出ない原因が I2C 待ち (update が長い) かスケジューリング (cycle だけ長い) かを切り分ける。
+    uint32_t debugUpdateUsAvg() const { return _updSamples ? (uint32_t)(_updUsSum / _updSamples) : 0; }
+    uint32_t debugUpdateUsMax() const { return _updUsMax; }
+    uint32_t debugCycleUsAvg() const { return _updSamples ? (uint32_t)(_cycleUsSum / _updSamples) : 0; }
+    uint32_t debugQuatUsAvg()  const { return _updSamples ? (uint32_t)(_quatUsSum / _updSamples) : 0; }
+    uint32_t debugTimingSamples() const { return _updSamples; }
+    bool debugTaskRunning() const { return _taskRunning && _taskHandle != nullptr; }
+    void debugResetTiming() { _updUsSum = _cycleUsSum = _quatUsSum = 0; _updSamples = 0; _updUsMax = 0; }
+    void debugAddTiming(uint32_t updUs, uint32_t cycleUs, uint32_t quatUs) {
+        _updUsSum += updUs; _cycleUsSum += cycleUs; _quatUsSum += quatUs; _updSamples++;
+        if (updUs > _updUsMax) _updUsMax = updUs;
+    }
     /// 受理された姿勢更新の通番。描画側が「前回と同じ姿勢か」を判定できる。
     uint32_t quatSeq() const { return _quatSeq; }
 
@@ -312,6 +326,10 @@ private:
     RawDumpRing _dump;             ///< imu_dump のリング (imu/ImuDiag.h)。バッファは下を借りる
     uint8_t* _dumpBuf = nullptr;   ///< loop 側で ps_malloc/free する (IMU タスクは armed 中だけ書く)
     volatile uint32_t _quatSeq = 0;///< 姿勢を受理するたびに +1 (描画側の鮮度判定用)
+    // 周期の内訳計測 (IMU タスクが加算、loop/httpd が読む。多少のズレは許容)
+    volatile uint64_t _updUsSum = 0, _cycleUsSum = 0, _quatUsSum = 0;
+    volatile uint32_t _updSamples = 0, _updUsMax = 0;
+    volatile uint32_t _lastQuatReadUs = 0;  ///< 直近の quat 読みの実時間 [us]
     TaskHandle_t _taskHandle = nullptr; ///< 専用ポーリングタスク
     volatile bool _taskRunning = false;
     static void taskFunction(void* parameter); ///< 固定周期ポーリングループ

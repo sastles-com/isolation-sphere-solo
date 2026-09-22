@@ -186,15 +186,6 @@ void setup() {
     // 目的は OTA: 普段の LAN に居れば PC の Wi-Fi を切り替えずに espota できる。
     network.beginStaFromStore(soloCfg.ap_ssid);
 
-    // IMU ポーリングを専用タスク (core1, 優先度3) で回す。loopTask (優先度1) から呼ぶと
-    // LCD 再描画やログで周期が乱れ (実測 中央値 22ms、最大 240ms)、描画が古い姿勢のまま
-    // 止まって「ジャンプ」に見える。描画 (優先度2) より先に走るので定刻を守れる。
-    if (imuSensor.isInitialized()) {
-        if (!imuSensor.startTask(1, 3, 4096)) {
-            sastle::Log.println("Failed to start IMU task (fallback: loop polling)");
-        }
-    }
-
     // OTA (espota) 初期化: AP が立った直後に受け口を開く。これ以降の初期化
     // (IMU / LED / 再生 / Web) で失敗・停止しても、無線での書き戻しは生き残る。
     // stopRenderTask() は _taskRunning ガードがあるため未初期化でも安全。
@@ -275,6 +266,17 @@ void setup() {
             if (!soloWeb.begin(config, soloPlayer, ledManager, network, imuSensor, config.getSoloHttpPort())) {
                 sastle::Log.println("Web server failed to start");
             }
+        }
+    }
+
+    // IMU ポーリングを専用タスク (core1, 優先度3) で回す。IMU 初期化の後・setup の最後に置く
+    // (以前は ota.begin() の直前 = IMU 初期化より前に置いてしまい、isInitialized() が false で
+    //  一度も起動していなかった。loop のフォールバックで 40/s しか出ていなかった原因)。loopTask (優先度1) から呼ぶと
+    // LCD 再描画やログで周期が乱れ (実測 中央値 22ms、最大 240ms)、描画が古い姿勢のまま
+    // 止まって「ジャンプ」に見える。描画 (優先度2) より先に走るので定刻を守れる。
+    if (imuSensor.isInitialized()) {
+        if (!imuSensor.startTask(1, 3, 4096)) {
+            sastle::Log.println("Failed to start IMU task (fallback: loop polling)");
         }
     }
 

@@ -150,7 +150,9 @@ bool IMUManager::_updateOnce() {
     const uint32_t nowMsTol = millis();
     const uint32_t sinceAccept = _validator.lastAcceptMs() ? (nowMsTol - _validator.lastAcceptMs()) : 10;
     const int partialTol = bno055::partialToleranceLsb(sinceAccept);
+    const uint32_t tQuat0 = micros();
     const bool readOk = _reader.readQuat(raw, qRaw, prevQ, _wordRead, partialTol, _cnt, straddles);
+    _lastQuatReadUs = micros() - tQuat0;   // quat 読み (4 ワード + w 再読み) だけの実時間
     if (!readOk) {
         _cnt.readFails++;
         _slots.readFail.offer(raw);   // 生バイトを退避 (ログは loop 側 takeDiagReadFail)

@@ -573,12 +573,16 @@ esp_err_t SoloWebServer::onImuGet(httpd_req_t* req) {
     int len = snprintf(self->_jsonBuf, sizeof(self->_jsonBuf),
         "{\"ok\":true,\"now\":%lu,\"i2c_khz\":%lu,\"word_read\":%s,\"aux\":%s,\"smooth\":%u,\"mode\":%u,"
         "\"cal\":\"%u%u%u%u\",\"quat\":[%.4f,%.4f,%.4f,%.4f],\"seq\":%lu,"
-        "\"reads\":%u,\"fails\":%u,\"discards\":%u,\"zero\":%u,\"partial\":%u,\"straddle\":%u",
+        "\"reads\":%u,\"fails\":%u,\"discards\":%u,\"zero\":%u,\"partial\":%u,\"straddle\":%u,"
+        "\"upd_us\":%u,\"upd_us_max\":%u,\"cycle_us\":%u,\"quat_us\":%u,\"timing_samples\":%u,\"task_running\":%s",
         (unsigned long)millis(), (unsigned long)(imu.i2cClock() / 1000), imu.wordRead() ? "true" : "false",
         imu.auxReads() ? "true" : "false", (unsigned)imu.smoothFrames(), (unsigned)imu.getOperationMode(),
         cs, cg, ca, cm, w, x, y, z, (unsigned long)imu.quatSeq(),
         (unsigned)imu.debugReadTotal(), (unsigned)imu.debugReadFails(), (unsigned)imu.debugDiscards(),
-        (unsigned)imu.debugZeroReads(), (unsigned)imu.debugPartialReads(), (unsigned)imu.debugStraddles());
+        (unsigned)imu.debugZeroReads(), (unsigned)imu.debugPartialReads(), (unsigned)imu.debugStraddles(),
+        (unsigned)imu.debugUpdateUsAvg(), (unsigned)imu.debugUpdateUsMax(),
+        (unsigned)imu.debugCycleUsAvg(), (unsigned)imu.debugQuatUsAvg(),
+        (unsigned)imu.debugTimingSamples(), imu.debugTaskRunning() ? "true" : "false");
     httpd_resp_send_chunk(req, self->_jsonBuf, len);
     char q[16];
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK && strstr(q, "dump=1")) {
@@ -630,6 +634,7 @@ esp_err_t SoloWebServer::onImuPost(httpd_req_t* req) {
     if (doc.containsKey("aux")) imu.setAuxReads(doc["aux"] | true);
     if (doc.containsKey("word_read")) imu.setWordRead(doc["word_read"] | true);
     if (doc.containsKey("reset") && (doc["reset"] | false)) imu.requestReset();
+    if (doc.containsKey("reset_timing") && (doc["reset_timing"] | false)) imu.debugResetTiming();
     if (doc.containsKey("dump")) {
         const int n = doc["dump"] | 0;
         if (n < 1 || n > 2000 || !imu.startRawDump((uint16_t)n)) {

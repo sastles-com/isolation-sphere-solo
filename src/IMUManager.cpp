@@ -30,8 +30,13 @@ void IMUManager::taskFunction(void* parameter) {
     // 保つにはこちらが必須。
     TickType_t lastWake = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(self->UPDATE_INTERVAL);
+    uint32_t prevWakeUs = micros();
     while (true) {
+        const uint32_t tStart = micros();
         self->_updateOnce();
+        const uint32_t tEnd = micros();
+        self->debugAddTiming(tEnd - tStart, tStart - prevWakeUs, self->_lastQuatReadUs);
+        prevWakeUs = tStart;
         // 周期を超過した場合 (I2C クロックを落とした / リトライが重なった) の保護。
         // vTaskDelayUntil は期限を過ぎていると即座に返るため、超過が続くと優先度 3 の
         // このタスクが core1 を独占し、同コアの loop (MQTT/OTA) と描画が飢餓する
