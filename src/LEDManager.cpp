@@ -7,6 +7,7 @@
 #include "FileManager.h"
 #include "common.h"
 #include "FastMath.h"
+#include "SphereMap.h"
 #include "BoardConfig.h"
 #include <FS.h>
 #include <LittleFS.h>
@@ -278,64 +279,12 @@ bool LEDManager::loadLayout(const char* path) {
 }
 
 void LEDManager::sphereToUV(float x, float y, float z, float& u, float& v) {
-    // 球面座標変換: (x, y, z) -> (u, v) — 極軸=Z の標準正距円筒 (equirectangular)。
-    //   u → px (画像の幅): 経度 -180..+180° (XY平面, 継ぎ目で wrap)
-    //   v → py (画像の高さ): 極角 0°(北極=+Z, 上端) .. 180°(南極=-Z, 下端) (clamp)
-    // WebUIデジタルツイン (server/frontend/src/components/sphere/HoloSphere.jsx:71)
-    // と同一式・同一量子化 trunc(u*(w-1)) にすること。
-    // (旧実装は u=緯度 / v=経度 と軸転置しており、u が 0.5..1.0 に収まるため
-    //  320px幅の右半分しかサンプリングしていなかった)
-
-    // 正規化（念のため）- FastMath.hの高速平方根を使用
-    float len = _sqrt(x*x + y*y + z*z);
-    if (len < 0.0001f) {
-        u = 0.5f;
-        v = 0.5f;
-        return;
-    }
-
-    float nx = x / len;
-    float ny = y / len;
-    float nz = z / len;
-
-    // 経度 (XY平面, -180..180°) → u → px (幅全域)
-    u = (_atan2(nx, ny) + 1.0f) / 2.0f;  // _atan2は-1.0~1.0を返す
-
-    // 極角 (+Zから 0..180°) → v → py (高さ全域)
-    // 第1引数 √(nx²+ny²) ≥ 0 なので _atan2 ∈ [0,1]。(+1)/2 は付けない。
-    float horizontal_dist = _sqrt(nx*nx + ny*ny);
-    v = _atan2(horizontal_dist, nz);
-
-    // クランプ
-    if (u < 0.0f) u = 0.0f;
-    if (u > 1.0f) u = 1.0f;
-    if (v < 0.0f) v = 0.0f;
-    if (v > 1.0f) v = 1.0f;
+    // 実体は SphereMap.h (純粋関数、native テスト済み)。WebUI デジタルツインと同一式。
+    sphere::toUV(x, y, z, u, v);
 }
 
 void LEDManager::rotateByQuaternion(float& x, float& y, float& z, float qw, float qx, float qy, float qz) {
-    // Quaternionでベクトルを回転: v' = q * v * q^-1
-    // 最適化された形: v' = v + 2 * cross(q.xyz, cross(q.xyz, v) + q.w * v)
-    
-    // cross1 = q.xyz × v
-    float cross1_x = qy * z - qz * y;
-    float cross1_y = qz * x - qx * z;
-    float cross1_z = qx * y - qy * x;
-    
-    // cross1 += q.w * v
-    cross1_x += qw * x;
-    cross1_y += qw * y;
-    cross1_z += qw * z;
-    
-    // cross2 = q.xyz × cross1
-    float cross2_x = qy * cross1_z - qz * cross1_y;
-    float cross2_y = qz * cross1_x - qx * cross1_z;
-    float cross2_z = qx * cross1_y - qy * cross1_x;
-    
-    // v' = v + 2 * cross2
-    x += 2.0f * cross2_x;
-    y += 2.0f * cross2_y;
-    z += 2.0f * cross2_z;
+    sphere::rotateByQuaternion(x, y, z, qw, qx, qy, qz);
 }
 
 void LEDManager::setIMUCompensation(bool enabled) {
@@ -504,6 +453,20 @@ void LEDManager::updateLEDBuffer() {
         if (_imuManager->getQuaternion(qw, qx, qy, qz)) {
             qx = -qx; qy = -qy; qz = -qz;
             useIMU = true;
+
+            // 姿勢の鮮度を計測する。描画が前フレームと同じ姿勢を使い回した回数を
+            // 数えると、「IMUが遅い」のか「描画が速すぎて姿勢が追いつかない」のか
+            // を切り分けられる。stale が多い = IMU側のレート不足。
+            const uint32_t seq = _imuManager->quatSeq();
+            if (seq == _lastQuatSeq) {
+                _stats.imu_stale_frames++;
+            }
+            _lastQuatSeq = seq;
+
+            // 姿勢の健全性診断 (ortho/norm/step の最大値。[QDIAG] が 2 秒ごとにリセット)。
+            // 実体は imu/AttitudeStepDiag.h (純粋関数、native テスト済み)。
+            _stepDiag.observe(qw, qx, qy, qz, _stats.imu_ortho_err_max,
+                              _stats.imu_norm_err_max, _stats.imu_step_deg_max);
         }
     }
 

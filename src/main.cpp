@@ -354,9 +354,26 @@ static void logPerfIfDue(unsigned long now) {
     LEDStats led = ledManager.getStats();
     ImageStats img = imageManager.getStats();
     SoloPlayer::Stats s = soloPlayer.stats();
+
+    // 姿勢の鮮度: 「前フレームと同じ姿勢で描いたフレーム」の割合。
+    // これが高いほど IMU のレートが描画に追いついていない = カクつく。
+    static uint32_t s_prevRendered = 0, s_prevStale = 0;
+    const uint32_t dRendered = led.frames_rendered - s_prevRendered;
+    const uint32_t dStale = led.imu_stale_frames - s_prevStale;
+    s_prevRendered = led.frames_rendered;
+    s_prevStale = led.imu_stale_frames;
+    const float stalePct = dRendered ? (100.0f * dStale / dRendered) : 0.0f;
+
+    // 姿勢データの健全性診断。ortho/norm が 0 でなければ渡っている quat が壊れている
+    // (非正規化 or torn read)。step は 1 フレームあたりの回転角の最大。
+    sastle::Log.printf("[QDIAG] ortho_max=%.6f norm_max=%.6f step_max=%.2fdeg\n",
+                       led.imu_ortho_err_max, led.imu_norm_err_max, led.imu_step_deg_max);
+    ledManager.resetImuDiag();
+
     sastle::Log.printf(
-        "[PERF] render_fps=%.1f map=%luus out=%luus | img_fps=%.1f decode=%luus jpeg=%uB drop=%lu | heap=%u\n",
+        "[PERF] render_fps=%.1f map=%luus out=%luus stale=%.0f%% | img_fps=%.1f decode=%luus jpeg=%uB drop=%lu | heap=%u\n",
         led.fps, (unsigned long)led.mapping_time_us, (unsigned long)led.output_time_us,
+        stalePct,
         img.fps, (unsigned long)img.decode_time_us, (unsigned)img.last_jpeg_size,
         (unsigned long)imageManager.getDropped(), (unsigned)ESP.getFreeHeap());
     sastle::Log.printf(
