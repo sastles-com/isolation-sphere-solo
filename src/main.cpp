@@ -90,8 +90,10 @@ void setup() {
     // 何よりも先に全ストリップへ黒を送信する。
     LEDManager::earlyBlank();
 
-    // シリアル初期化
+    // シリアル初期化。Log の退避バッファ (PSRAM) も同時に用意する。server モードで MQTT に
+    // 繋がると、ここ以降の起動ログがまとめて sphere/<id>/log に流れる。
     Serial.begin(115200);
+    sastle::Log.begin();
 
     // Sound初期化を最優先で行い、起動音を即再生する。
     // 理由: WiFi/LCD初期化が終わるまでLED表示は数秒かかるため、
@@ -165,26 +167,21 @@ void setup() {
     // UI で変えた設定 (明るさ等) を NVS から復元する
     sastle::Settings::begin();
 
-    // SoftAP を立てる。失敗しても停止しない (動画があれば iPhone 無しでも
-    // 自動再生する要件)。
+    // Wi-Fi を立てる: STA (NVS の LAN > config の P2P 網) を先行させ、SoftAP を常に立てる。
+    // 失敗しても停止しない (動画があれば iPhone 無しでも自動再生する要件)。
     SoloConfig soloCfg = config.getSoloConfig();
     IPAddress apIp;
     if (!apIp.fromString(soloCfg.ap_ip)) {
         apIp = IPAddress(192, 168, 4, 1);
     }
-    if (!network.beginSoftAP(soloCfg.ap_ssid, soloCfg.ap_password, apIp)) {
+    if (!network.begin(config)) {
         sastle::Log.println("SoftAP start FAILED (playback continues without Web UI)");
     }
-    // LCD に出す接続 QR。カメラで読むと iPhone が AP 接続を提案し、接続後は
-    // キャプティブポータル検出で Web UI が自動的に開く。
+    // LCD に出す接続 QR。カメラで読むと iPhone が AP 接続を提案する。
     g_apSsid = soloCfg.ap_ssid;
     g_wifiQrText = NetworkManager::wifiQrText(soloCfg.ap_ssid, soloCfg.ap_password);
     g_uiUrl = "http://" + apIp.toString() + "/";
     sastle::Log.printf("[SOLO] Wi-Fi QR: %s  UI: %s\n", g_wifiQrText.c_str(), g_uiUrl.c_str());
-
-    // 任意の STA 併用 (AP+STA)。資格情報は NVS に置く (Web UI の「LAN 接続」から設定)。
-    // 目的は OTA: 普段の LAN に居れば PC の Wi-Fi を切り替えずに espota できる。
-    network.beginStaFromStore(soloCfg.ap_ssid);
 
     // OTA (espota) 初期化: AP が立った直後に受け口を開く。これ以降の初期化
     // (IMU / LED / 再生 / Web) で失敗・停止しても、無線での書き戻しは生き残る。
@@ -426,7 +423,8 @@ void loop() {
     ota.handle();
 
     // キャプティブポータル DNS の応答と、HTTP 経由の再起動要求の実行
-    network.poll();   // STA 接続状態の変化をログに出す
+    network.poll();   // STA 接続状態の変化をログに出し、切断時はバックオフ再接続
+    sastle::Log.loop();   // 退避ログを MQTT へ (sink 未登録なら即 return)
     soloWeb.loop();
 
     // シリアルコンソール

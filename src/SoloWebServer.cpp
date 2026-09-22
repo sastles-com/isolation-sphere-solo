@@ -400,7 +400,7 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
         "\"last_frame_bytes\":%u,\"read_us\":%u,\"tick_us\":%u},"
         "\"fs\":{\"total\":%u,\"used\":%u,\"free\":%u,\"max_upload\":%u},"
         "\"ap\":{\"ssid\":\"%s\",\"ip\":\"%s\",\"clients\":%u},"
-        "\"sta\":{\"enabled\":%s,\"connected\":%s,\"ssid\":\"%s\",\"ip\":\"%s\"},"
+        "\"sta\":{\"enabled\":%s,\"connected\":%s,\"ssid\":\"%s\",\"ip\":\"%s\",\"origin\":\"%s\"},"
         "\"led\":{\"mode\":\"%s\",\"pattern\":\"%s\",\"width\":%u,\"axis\":%s},"
         "\"imu\":{\"ok\":%s,\"mode\":%u,\"cal\":\"%u%u%u%u\","
         "\"quat\":[%.3f,%.3f,%.3f,%.3f],\"reads\":%u,\"fails\":%u,\"discards\":%u,\"partial\":%u,\"straddle\":%u,\"seq\":%u,\"smooth\":%u},"
@@ -423,6 +423,7 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
         self->_net && self->_net->staConnected() ? "true" : "false",
         self->_net ? self->_net->staSsid().c_str() : "",
         self->_net && self->_net->staConnected() ? WiFi.localIP().toString().c_str() : "",
+        self->_net ? self->_net->staOriginName() : "none",
         self->_led->getOutputMode() == LEDManager::OutputMode::Test ? "test"
             : (self->_led->getOutputMode() == LEDManager::OutputMode::Manual ? "manual" : "sphere"),
         self->_led->getTestPattern() == LEDManager::TestPattern::Chase ? "chase" : "strip",
