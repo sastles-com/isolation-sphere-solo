@@ -102,10 +102,13 @@ LittleFS の同梱物 1.35MB → **39KB**。
 ### 状態遷移 (SoloPlayer)
 
 ```
-起動 ──有効な動画あり──▶ playing ◀─play─ stopped
-  │                       │  ▲          ▲
-  └─動画なし──▶ no_video   stop        │
-  └─破損/解像度違い─▶ error            │
+起動 ──有効な動画あり──▶ playing ──pause──▶ paused (表示は現在のフレームのまま)
+  │                       │  ▲  ▲            │
+  │                     stop │  └────play─────┘ (続きから)
+  │                       ▼  │
+  │                    stopped (LED 消灯。play で続きから)
+  └─動画なし──▶ no_video (消灯)
+  └─破損/解像度違い─▶ error (消灯)
 アップロード開始 ─▶ uploading ─成功─▶ playing (先頭から)
                             └─失敗─▶ 旧動画があれば playing / 無ければ no_video
 ```
@@ -127,7 +130,48 @@ tools/make_solo_video.sh input.mp4 video.mjpg -q 6
 tools/make_solo_video.sh input.mov video.mjpg --fit pad -t 30
 ```
 
-MP4/MOV/HEVC を ESP32 上で変換する機能は無い (PC 側で事前変換する)。
+MP4/MOV/HEVC を ESP32 上で変換する機能は無い (ESP32 では H.264 をデコードできない)。
+
+### ブラウザ変換 (`docs/convert.html` → ファームに埋め込み `/convert`)
+
+iPhone のカメラ動画を PC を介さずに変換するための単体ページ。**変換はすべて閲覧端末のブラウザ内**で
+行われ、球体側の負荷はゼロ (ページを配信するだけ)。
+
+```
+Safari                                         ESP32
+ <video> で H.264 デコード (HWデコーダ)          ← 負荷ゼロ
+ canvas.drawImage() で 320×160 へ伸縮
+ canvas.toBlob('image/jpeg') を Blob で連結
+ POST /api/video ───────────────────────────▶  既存のアップロード経路 (変更不要)
+```
+
+`canvas` の JPEG 出力は Baseline (SOF0) なので `JpegScan` がそのまま受理する。APPn (JFIF/EXIF) は
+マーカー長で読み飛ばされるため無害。**ファイルに fps 情報は入らない** (`SoloPlayer` は `kSoloFps=10`
+固定で再生する) ので、「10fps にする」= 元動画のタイムラインを 100ms 刻みでサンプリングすることを指す。
+30fps の全フレームを出力すると 3 倍のスローモーションになる。
+
+| 項目 | 実装 |
+| --- | --- |
+| アスペクト比 | **2:1 への押し潰し固定** (元フレーム全体を 320×160 へ伸縮)。正距円筒として全周に貼るため、クロップやレターボックスより情報の欠落が無い方を採った |
+| フレーム取り出し | `requestVideoFrameCallback` で `mediaTime` を見ながら 100ms スロットを埋める (2 倍速再生で実時間の半分)。取りこぼしたスロットは直前のフレームで埋めてフレーム数 = 再生時間を保つ。非対応ブラウザは 1 フレームずつシークする方式にフォールバック |
+| サイズ見積り | 中央の 1 フレームを実際に符号化して 1f あたりのバイト数を測り、フレーム数を掛ける。`/api/status` が読めれば `fs.max_upload` と比較して変換前に警告する |
+| 制限チェック | 1 フレーム 64KiB 超 / 総サイズが上限超のときは画質・長さの調整を促す |
+| 出力 | `video.mjpg` を保存 / 共有。同一オリジン (球体が配信している場合) では `/api/video` へ直接アップロード |
+
+**球体が `/convert` として配信する** (2026-09-22 実装)。AP 接続中の iPhone はインターネットに
+出られないため外部サイトの変換ページを開けず、「iPhone の動画をそのまま入れたい」という要件は
+同一オリジンでしか満たせない。正本は `docs/convert.html` (単体でもブラウザで開ける) で、
+`python3 tools/embed_convert.py` が `src/ConvertPage.h` (PROGMEM) を生成する。**docs/convert.html を
+編集したら必ず再生成すること**。埋め込みによるフラッシュ増は約 14KB (62.9% → 63.6%)。
+
+**本体 UI にはファイル選択欄を置かない。** 動画の入れ替えは `/convert` への入口ボタン 1 つだけにし、
+ファイルを選ぶのはそのページでの 1 回に統一した (本体 UI で選んでから変換ページへ遷移すると、
+File オブジェクトは遷移で失われて選び直しになるため)。`/convert` は選ばれたファイルの先頭 3 バイトと
+拡張子を見て、**すでに raw MJPEG なら変換を飛ばして直接アップロード**する。その際はブラウザ側で
+全フレームを走査し、ファーム側の受理条件 (Baseline / 320×160 / 1 フレーム 64KiB 以下 / 末尾にゴミ無し)
+を先に検査して、`corrupt JPEG structure` で弾かれる前に理由を表示する。
+アップロードが成功したら結果を 1.2 秒表示して `/` へ戻る (球体は既に先頭から再生している)。
+失敗時は理由を読めるようページに留まる。
 
 容量の目安 (10fps)。LittleFS 3.94MB のうち同梱物は 39KB なので、動画に約 3.9MB 使える。
 
@@ -181,11 +225,51 @@ pio run -e atoms3r -t uploadfs    # data/ を LittleFS へ (config.json, レイ�
    Assistant) に Web UI を表示する**。Android (`/generate_204`) / Windows (`/connecttest.txt`) も同様。
 4. 端末が接続されると LCD は映像 / STANDBY 表示に戻る。切断すると QR に戻る。
 
-iOS の「ログイン」画面は簡易ブラウザで、**ファイル選択が動かないことがある**。UI は `?cna=1` のとき
-「アップロードは Safari で `http://192.168.4.1/` を開く」旨のバナーを出す。再生/停止/明るさはその画面で操作できる。
+**既定ではキャプティブポータルを開かせない** (`solo.captive_portal = false`)。iOS の「ログイン」画面
+(Captive Network Assistant) は簡易ブラウザで **`<input type=file>` のダイアログが出ず、動画を
+アップロードできない** (実機で確認)。そのため OS の検出プローブには期待どおりの応答を返し、
+利用者には最初から Safari で開いてもらう:
 
-QR を印刷したい場合は、シリアルログ `[SOLO] Wi-Fi QR: WIFI:T:WPA;S:...;P:...;;` の文字列を
-任意の QR 生成ツールに入れればよい (画像化ライブラリは同梱していない)。
+| プローブ | 応答 |
+| --- | --- |
+| iOS/macOS `/hotspot-detect.html`, `/library/test/success.html` | `<HTML>…<BODY>Success</BODY></HTML>` |
+| Android `/generate_204`, `/gen_204` | 204 No Content |
+| Windows `/connecttest.txt` / `/ncsi.txt` | `Microsoft Connect Test` / `Microsoft NCSI` |
+| Firefox/NM `/success.txt` | `success` |
+| 上記以外の未知パス | `http://192.168.4.1/?cna=1` へ 302 (利用者が何か入力した場合の救済) |
+
+導線は **QR 2 枚**:
+
+1. LCD の **Wi-Fi QR** (端末が未接続のとき表示) → カメラで読むと AP 参加を提案
+2. 参加後、LCD が **UI の URL QR** (`http://192.168.4.1/`) に切り替わる → カメラで読むと **Safari** が開く
+   (`SoloWebServer::uiServed()` が false の間だけ表示。UI を一度開いたら映像 / STANDBY へ戻る)
+
+`tools/make_wifi_qr.py` はこの 2 枚を `docs/wifi_qr.png` / `docs/ui_qr.png` として出力するので、
+LCD 非搭載機や印刷運用でも同じ導線が取れる。
+
+`solo.captive_portal = true` にすると従来どおり接続と同時に UI が自動で開く (アップロードは
+Safari で開き直す必要あり)。既定値はコード側 (`getSoloCaptivePortal()`) も false なので、
+config.json を更新していない機体でも抑止側で動く。
+
+### QR 画像の生成 (`tools/make_wifi_qr.py`)
+
+印刷して本体に貼る / LCD 非搭載機 (XIAO ESP32S3) 向けに、`data/config.json` の `solo.ap` から
+QR 画像を生成する。文字列の組み立て (エスケープ規則・パスワード 8 文字未満は `nopass`) は
+`NetworkManager::wifiQrText()` と同一。
+
+```bash
+pip install segno            # cairosvg があればラベルの PNG も出る
+python3 tools/make_wifi_qr.py
+```
+
+| 出力 | 内容 |
+| --- | --- |
+| `docs/wifi_qr.png` | 接続用 QR。`WIFI:T:WPA;S:isolation-sphere;P:sphere-solo;;` (33×33 モジュール, version 4) |
+| `docs/ui_qr.png` | 接続後に開く `http://192.168.4.1/` の URL QR |
+| `docs/wifi_qr_label.svg` / `.png` | QR + SSID / パスワード / URL を並べた印刷用ラベル |
+
+生成した 3 つの画像は zxing-cpp でデコードして内容を確認済み。シリアルログにも
+`[SOLO] Wi-Fi QR: WIFI:T:WPA;S:...;P:...;;` が出るので、任意の QR 生成ツールに入れてもよい。
 
 ### NFC について
 
@@ -195,13 +279,32 @@ QR を印刷したい場合は、シリアルログ `[SOLO] Wi-Fi QR: WIFI:T:WPA
 - 接続後のショートカットとして、`http://192.168.4.1/` を書いた**受動 NFC タグ**を球体に貼るのは有効
   (ファーム変更不要、iPhone XS 以降は画面点灯中に近づけるだけで Safari が開く)。任意のオプション。
 
+### OTA の経路: AP 経由と LAN (STA) 経由
+
+AP 経由 (`atoms3r_ota` → 192.168.4.1) は、書き込む PC の Wi-Fi を球体の AP に繋ぎ替える必要があり、
+その間 PC はインターネットから切れる。開発中はこれが煩雑なので **AP+STA 同時接続**を用意した。
+
+- Web UI の「LAN 接続 (開発用 / 任意)」に普段の Wi-Fi の SSID / パスワードを入れて保存 → 再起動
+- 球体は **AP を維持したまま** STA でも接続する (`WIFI_AP_STA`)。iPhone は従来どおり AP に繋がる
+- PC は普段の LAN のまま `pio run -e atoms3r_lan_ota -t upload` で書き込める
+  (宛先は mDNS の `isolation-sphere.local`。解決できなければ `/api/status` の `sta.ip` を指定)
+
+資格情報は **NVS に保存**する (`Preferences`, namespace `solo`)。config.json に書かないのは、
+自宅 Wi-Fi のパスワードがリポジトリに混入するのを避けるため。SSID を空で保存すると無効化。
+`/api/status` に `sta:{enabled,connected,ssid,ip}` が出る。
+
+注意: ESP32 は AP と STA で無線を共有するため、**AP のチャンネルは STA 側に追従する**。
+STA が 5GHz 専用 AP にしか繋がらない環境では使えない (ESP32-S3 は 2.4GHz のみ)。
+
 ## 7. HTTP API
 
 | Method | Path | Body | 説明 |
 | --- | --- | --- | --- |
-| GET | `/` | — | Web UI (`?cna=1` でキャプティブ画面向けバナー) |
+| GET | `/` | — | Web UI (`?cna=1` でキャプティブ画面向けバナー。`uiServed` を立てる) |
+| GET | `/convert` | — | 動画変換ページ (ブラウザ内で 320×160/10fps の raw MJPEG に変換し、そのまま `/api/video` へ) |
 | GET | `/api/status` | — | 状態・動画情報・統計・容量・AP 情報 (`ap.clients` = 接続端末数) |
-| POST | `/api/play` / `/api/stop` | — | 再生 / 停止 (uploading 中は 409) |
+| POST | `/api/play` / `/api/pause` / `/api/stop` | — | 再生 / 一時停止 (表示維持) / 停止 (消灯) (uploading 中は 409) |
+| POST | `/api/wifi` | `{ssid, password}` | STA (LAN) の資格情報を NVS に保存。空 SSID で無効化。反映は再起動後 |
 | POST | `/api/brightness` | `{"value":0-100}` | 明るさ (再起動で `params.brightness` に戻る) |
 | POST | `/api/video` | 動画本体 (`application/octet-stream`) | アップロード。成功 200 / 検証失敗 400 / 容量不足 507 / 競合 409 |
 | POST | `/api/video/delete` | — | 動画削除 → `no_video` |
@@ -214,7 +317,22 @@ curl -s -X POST --data-binary @video.mjpg -H 'Content-Type: application/octet-st
 curl -s -X POST -d '{"value":30}' http://192.168.4.1/api/brightness
 ```
 
-## 8. 設定 (`data/config.json`)
+## 8. 設定 (`data/config.json` と NVS)
+
+役割分担: **config.json = 出荷時の既定値**、**NVS = 利用者が UI で変えた値**。起動時は NVS が
+あればそちらを使い、無ければ config.json を読む。
+
+| 項目 | 保存先 | 書き込み契機 |
+| --- | --- | --- |
+| 明るさ | NVS (`solo`/`bri`) | `/api/brightness` の最後の変更から 3 秒後に 1 回 ([Settings.cpp](../src/Settings.cpp))。再起動要求時は即座に確定 |
+| STA (LAN) の SSID / パスワード | NVS (`solo`/`sta_ssid`,`sta_pass`) | `/api/wifi` |
+| 解像度・AP・動画パス・オープニング等 | `config.json` | `uploadfs` |
+
+スライダーは操作中に値が連続で飛んでくるため、変更のたびに書くとフラッシュを無駄に消耗する。
+`Settings::setBrightness()` は RAM を更新して保留にするだけで、`Settings::tick()` が最後の変更から
+3 秒経ってから 1 回だけ書く。値が変わっていなければ書かない。
+
+
 
 | キー | 既定 | 説明 |
 | --- | --- | --- |
@@ -234,17 +352,127 @@ curl -s -X POST -d '{"value":30}' http://192.168.4.1/api/brightness
 
 | コマンド | 結果 |
 | --- | --- |
-| `pio test -e native` | JPEG 境界パーサー **13 ケース PASS** (完全フレーム、全プレフィックスで NeedMore、連結分割、APP1 内 EOI 非誤検出、非 SOI、progressive 判定、マーカー間ゴミ、SOS 前 EOI、SOI 入れ子、フィルバイト、長さ 0 セグメント、TEM/RSTn、null) |
+| `pio test -e native` | **20 ケース PASS**。JPEG 境界パーサー 13 ケース (完全フレーム、全プレフィックスで NeedMore、連結分割、APP1 内 EOI 非誤検出、非 SOI、progressive 判定、マーカー間ゴミ、SOS 前 EOI、SOI 入れ子、フィルバイト、長さ 0 セグメント、TEM/RSTn、null) + `MjpegAssembler` 7 ケース (復帰後のフレームが無傷: read 幅 1/3/64/700/2048/一括、先読みの温存、切れた末尾の破棄とループ、非ループ時の Eof/Truncated、TooLarge、空/ゴミ) |
 | `pio run -e atoms3r` | **SUCCESS**。Flash 1,734,465 / 2,097,152 bytes (82.7%)、RAM 68,484 / 327,680 bytes (20.9%) |
 | `pio run -e xiao_esp32s3` | **SUCCESS**。Flash 1,466,289 bytes (69.9%)、RAM 64,920 bytes (19.8%)。LCD 無しのため QR 表示は無効 |
 
+### 実機で確認したこと (2026-09-22, AtomS3R, USB 給電)
+
+書き込みは USB (`uploadfs` → `upload` の順。先に FS を 0x410000 へ置き、表とアプリを書いてから初回起動させる)。
+
+| 項目 | 結果 |
+| --- | --- |
+| 起動 → 自動再生 → ループ | OK。`state=playing loops=2`、`tools/make_test_pattern.py` の 100 フレーム動画 |
+| 100ms 締切 | **fps=10.0 miss=0**。`read=4-6ms` (LittleFS→PSRAM 2048B 追記読み) + `decode=62ms` (TJpgDec 320×160 4:2:0) = `tick=67-70ms`、余裕 約30ms |
+| デコード | **decode_err=0** (下記の不具合修正後)。修正前は 100 フレーム中 87 が `JDR_FMT1` |
+| LittleFS / config / SoftAP / OTA 受け口 / Web (port 80) | すべて起動。QR 文字列 `WIFI:T:WPA;S:isolation-sphere;P:sphere-solo;;` を出力 |
+| メモリ | `heap_free≈205KB`、PSRAM 8MB 認識、`solo_play` スタック残 3.7KB / 6KB |
+| IMU | `Scan done: 0 device(s)` — **AtomS3R を本体から外して試験したため** (BNO055 は本体側)。IMU 無しで続行できることの確認になった |
+| LED 出力 | **`out=55-58ms` (render_fps 16.6)**。設計値 6-8ms に対し約 8 倍遅い。未解決 (下記) |
+
+#### 実機で見つかった不具合: 先読みバイトによるフレーム上書き (修正済み)
+
+症状: 再生は始まるが 100 フレーム中 87 が `drawJpg → JDR_FMT1` で落ち、失敗するフレームは毎ループ同一。
+LED 出力を止めても、内部 RAM にコピーしても、PC で同じ `tjpgd.c` を走らせても再現せず、
+LittleFS の読み出し自体 (PSRAM/内部 RAM、512-9496B の各チャンク幅) は全 233 チャンク一致。
+デコーダに渡したバイト列の CRC32 をフレームごとに出して PC と照合したところ不一致で、frame0 の
+壊れた 180..744 バイト目が **frame1 の同オフセットのバイト列と完全一致** (744 = 先読み量) した。
+
+原因: `MjpegReader::next()` がフレーム確定時に先読み分をバッファ先頭へ `memmove` してから return
+していた。呼び出し側 (`SoloPlayer`) がデコードする時点で、返したフレームの先頭が次フレームで
+上書きされている。先頭 180 バイトが無事に見えたのは SOI/APP0/DQT が隣接フレームと同一だったため。
+先読み量が小さいフレームだけ生き残る = 決定的なパターン。
+
+修正: 先読みの寄せを **次回 `next()` 呼び出しの冒頭**に遅延 (`_consumed`)。バッファ管理を Arduino
+非依存の [`src/MjpegAssembler.h`](../src/MjpegAssembler.h) に切り出し、`MjpegReader::next()` と
+`validate()` の両方がこれを使う。`test/test_mjpeg_assembler` が「復帰後のフレームが無傷」を
+read 幅ごとに検証する (PC でこの呼び出し順を再現すると修正前は 87/100 が実機と同一パターンで失敗、
+修正後は 0/100)。
+
+#### 未解決: LED 出力 55-58ms
+
+FastLED 3.10.5 の RMT4 ドライバ (IDF 4.4)。ESP32-S3 の RMT TX チャンネルは 4 本
+(`SOC_RMT_TX_CANDIDATES_PER_GROUP=4`) で、AtomS3R の 5 ストリップ目は「時分割」で後回しになる。
+完了検出はポーリング + 1ms スライス (`ChannelManager::waitForPollNeededSignal`)。それでも 58ms の
+説明には足りない。**試して外れたもの**: FastLED の実行時ログ無効化 (`FASTLED_LOG_VERBOSITY=0`、
+`out=53-56ms` で変化なし。フラッシュ削減のため設定は残した)。残る切り分け候補は
+(a) `-D BOARD_NUM_STRIPS=4` で 4 ストリップ構成にして `out=` を計測 (時分割の影響を確定)、
+(b) `FASTLED_RMT_MEM_BLOCKS` 増加、(c) S3 の I2S/LCD_CAM 並列ドライバへの切替。映像 10fps の表示自体は間に合っており、
+影響は IMU 姿勢追従の滑らかさ (設計 50-60Hz → 実測 16.6Hz)。
+
+#### 本体に組み込んで LiPo 起動: 起動音 → 全 LED 白点灯 → 電源断 (対処中)
+
+上表の実機確認はすべて **AtomS3R を本体から外して USB 単体**で行ったもの (LED 800 個と BNO055 は
+本体側)。本体に戻して LiPo で起動すると、起動音の直後に全 LED が白点灯し電源が落ちた。
+起動順序は `earlyBlank()` (全ストリップに黒を送信) → Serial → 起動音 → 2 秒待ち、なので、
+**黒を送ったはずの `earlyBlank()` が LED に白として受け取られている** (データ線のタイミング逸脱で
+0 ビットが 1 に読まれる) と見ている。
+
+同じ 3.10.5 ビルドで、本体に組み込んだまま USB 給電で起動したときは**全 LED が暗い赤**で点灯した
+(電源電圧の違いで LED 側の閾値が変わったと見れば、白と同じ「黒データが別の値に読まれる」症状)。
+
+以前動いていた core ビルドとの差は FastLED の版。指定は同じ `^3.7.8` だが現在は **3.10.5** に解決され、
+ESP32 の RMT ドライバが ChannelManager 実装 (S3 の TX 4 チャンネルに 5 ストリップを時分割) に
+置き換わっている。core の現行ソースが 3.10 ではビルドできない (`memset` 曖昧呼び出し) ことから、
+以前の書き込みは 3.10 より前の版。ベンチの LED 出力 55ms (設計値 6-8ms) も同じ差の症状と考えられる。
+
+対処: `platformio.ini` で **FastLED を 3.7.8 に固定** (元プロジェクトが `^3.7.8` を宣言した時点の版 =
+球体が動いていた実績のある版)。この版でのビルドは Flash **1,307,717 bytes** (3.10.5 では 1,721,757、
+3.9.20 では 1,329,397) と約 414KB 小さく、**旧 1.5MB スロットにも収まる**。今日の表変更の前提
+「ファームが 1.5MB に入らない」は 3.10 系の RMT 実装が原因だった。
+3.7.8 に下げたところ、ベンチで起動直後に **`Guru Meditation Error: Core 1 panic'ed (Cache disabled but
+cached memory region accessed)`** のリブートループになった。バックトレース:
+`ESP32RMTController::interruptHandler → doneOnChannel → startNext → rmt_set_tx_thr_intr_en` (Core1 の
+RMT 割り込みがフラッシュ上の IDF 関数を呼ぶ) と、同時刻の Core0 `SoloPlayer::begin → validate →
+File::read → esp_flash_read` (キャッシュ無効化)。以前の core は映像を UDP で受けていてフラッシュを
+読み続けなかったため踏まなかった。**solo が LittleFS を 10fps で読む構成では必ず起きる**。
+対策として `-D FASTLED_ESP32_FLASH_LOCK=1` (show() の間 `spi_flash_op_lock()`) を両 env に追加。
+3.10.5 では起きなかった (新実装は ISR を IRAM に置き、二重バッファで WiFi 干渉耐性を持つ) ので、
+「白点灯」と「フラッシュ競合」は版のトレードオフになっている。
+
+ベンチ計測 (3.7.8 + `FASTLED_ESP32_FLASH_LOCK=1`, LED 未接続):
+
+| 項目 | 3.10.5 | 3.7.8 + FLASH_LOCK |
+| --- | --- | --- |
+| LED 出力 `out=` | 53-58ms | **15.2ms** |
+| `render_fps` | 16.6 | **48.8-49.0** (設計値 50-60Hz にほぼ到達) |
+| LittleFS 読み出し `read=` | 4-6ms | 10-20ms (show() 中はフラッシュロックで待たされる) |
+| `tick=` (read + decode) | 67-70ms | 68-82ms (100ms 締切に対し余裕 約18ms) |
+| 再生 / デコード | fps=10.0 miss=0 err=0 | fps=10.0 miss=0 err=0 |
+| パニック | なし | なし (FLASH_LOCK 無しではリブートループ) |
+
+`read=` の増加はロック待ちによるもので、締切内に収まっている。余裕が欲しくなったら
+`kReadChunk` を大きくして read 回数を減らすか、デコードを先に走らせる順序に変える。
+**本体に組み込んで LiPo 起動: 全白は出なくなった** (2026-09-22 夜、ユーザー確認)。
+FastLED 3.10.5 の RMT 実装が原因だったと確定。
+
+追加の実機フィードバックと対応:
+- 停止しても最後のフレームが LED に残る → `ImageManager::publishBlack()` を追加し、`stop()` /
+  動画クローズ (削除→no_video) / エラー時に全画素 0 のフレームを公開して消灯する。
+  描画タスクは公開済みフレームを再マッピングし続ける設計なので、黒フレームを流すのが最小の変更。
+- Web UI からファイルをアップロードできない → `<input type=file>` の `accept=".mjpg,…"` を撤去。
+  iOS は accept に未知の拡張子があると「ファイル」アプリで該当ファイルがグレーアウトして選べない。
+  形式検証はサーバ側 (validate) が行うので accept は不要。
+
+FastLED を使わない選択肢: NeoPixelBus の S3 LCD_CAM 並列 (`NeoEsp32LcdX8Ws2812xMethod`, 8 本まで
+真の並列) が本命。LEDManager の出力部差し替えと、色計算・電流制限の自前化が必要。
+姿勢追従を設計値 50-60Hz で回す必要が出たときに検討する。
+
+#### 起動経路の変更 (組み立て後の復旧手段を確保)
+
+起動直後の `delay(2000)` (シリアルモニタ接続待ち) は、USB ホストが繋がっているとき
+(`Serial.isConnected()`, HWCDC) だけ 300ms 待つように変更。電池駆動では待たない。
+
+LittleFS マウント失敗・`config.json` 読み込み失敗で `while(1)` 停止していた箇所を撤去し、
+ConfigManager のコンパイル時既定値で続行する。`ota.begin()` を SoftAP 直後に前倒しし、以降の初期化
+(IMU / LED / 再生 / Web) が止まっても無線の書き戻しが生き残るようにした
+(USB 端子に触れない筐体で、閉じた後に文鎮化する経路を潰す)。
+
 ### 実機で未確認のこと (次にやる実機チェック)
 
-1. **起動と自動再生**: 動画を入れた状態で iPhone も PC も無しに電源投入 → 再生開始、EOF でループ
-   (`[SOLO] loops=` が増える)
-2. **締切**: `[SOLO] miss=` が増え続けないこと。`read=…us tick=…us` が 100ms を十分下回ること
-   (LittleFS 読み出し + デコードの実測値を記録する)
-3. **姿勢追従**: 再生中に回転させ、派生元と同じ追従性か (`render_fps` が落ちていないか)
+1. ~~起動と自動再生~~ → 確認済み (上表)
+2. ~~締切~~ → 確認済み (上表)。ただし球体本来の電源での再確認が未了 (USB 給電で計測)
+3. **姿勢追従**: IMU が I2C に見えていないため未確認。配線 (Grove, GPIO1/2) か `atoms3r_m5imu` 環境かを確定させてから。`render_fps` は現状 16.6
 4. **QR と自動起動**: LCD の QR を iPhone のカメラで読めるか (照度・サイズ)。接続後に「ログイン」画面が
    自動で開くか。接続すると LCD が映像 / STANDBY に戻るか
 5. **iPhone Safari**: UI 表示 → アップロード進捗 → 完了後に先頭から再生 → 切断後も再生継続
@@ -255,14 +483,21 @@ curl -s -X POST -d '{"value":30}' http://192.168.4.1/api/brightness
 8. **メモリ**: `/api/status` の `heap_free` / `psram_free` と各タスクのスタック余裕
    (`uxTaskGetStackHighWaterMark`) を記録する
 9. **OTA**: パーティション変更後、USB で 1 回書いた機体に対して `atoms3r_ota` で更新できること
+10. **ブラウザ変換** (`docs/convert.html`): iPhone Safari で `requestVideoFrameCallback` が動くか
+    (非対応ならシーク方式に落ちる)。変換所要時間・1f あたりのバイト数・生成した `.mjpg` が
+    アップロード検証を通るか。`<input type=file>` から camera roll の動画を選べるか
 
 ### 既知の制約
 
 - 音声・シーク・複数動画・プレイリスト・サムネイルは無い (要件どおり)
-- iPhone 内の動画を直接変換する機能は無い (PC で `tools/make_solo_video.sh`)
-- 明るさは再起動で `config.json` の値に戻る (フラッシュ寿命を考慮して毎回の永続化はしない)
+- LED 出力が 1 フレーム 55-58ms かかる (FastLED RMT4 / 5 ストリップ > S3 の 4 チャンネル)。映像 10fps は間に合うが姿勢追従は 16.6Hz 止まり (§9)
+- 本体に組み込んだ状態では **USB 給電で映像を再生できない** (LED 800 個の電流に足りず、起動直後の
+  オープニングや再生開始で電圧が落ち USB が切れる)。書き込みは USB で可、動作確認は LiPo で行う
+- ESP32 上で動画を変換する機能は無い。PC なら `tools/make_solo_video.sh`、iPhone 単体なら
+  `docs/convert.html` (ブラウザ内変換、実機未確認)
+- 明るさは NVS に保存され再起動後も復元される (§8)。config.json の値は「まだ一度も変えていないとき」の既定値
 - QR 表示は LCD 搭載機 (AtomS3R) かつ `LCD.debug = true` のときのみ
-- iOS の「ログイン」画面ではファイル選択が使えない場合がある (Safari で開けば可)
+- iOS の「ログイン」画面 (CNA) ではファイル選択ダイアログが出ない → 既定でキャプティブポータルを抑止し、LCD の URL QR から Safari で開く導線にした (§6)
 - `TJpg_Decoder` はグローバル単一インスタンスのため、デコードを複数タスクから同時に呼べない
   (現状 `SoloPlayer` タスクのみが呼ぶ)
 - LED 出力モード `Manual` (外部から画素を直接書く) は制御経路が無いため実質未使用。

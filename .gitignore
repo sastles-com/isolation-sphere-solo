@@ -3,3 +3,6 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# 生成物: tools/make_test_pattern.py で再生成できるテスト動画 (0.9MB)
+data/video.mjpg

@@ -34,13 +34,14 @@ constexpr size_t kSoloMaxFrameBytes = 65536;
  * 状態遷移:
  *   NoVideo   : 有効な動画ファイルが無い (UI からアップロード可)
  *   Playing   : 再生中 (起動時に有効な動画があれば自動でここへ)
- *   Stopped   : ユーザー操作で停止中 (最後の表示フレームは維持)
+ *   Paused    : 一時停止 (現在のフレームを表示したまま止まる。play で続きから)
+ *   Stopped   : 停止 (LED は消灯。play で続きから再開)
  *   Uploading : アップロード受信中 (再生停止・ファイルクローズ)
  *   Error     : 動画ファイルが壊れている等 (UI から再アップロードで復旧)
  */
 class SoloPlayer {
 public:
-    enum class State : uint8_t { NoVideo, Playing, Stopped, Uploading, Error };
+    enum class State : uint8_t { NoVideo, Playing, Paused, Stopped, Uploading, Error };
 
     struct Stats {
         uint32_t frames;          ///< 公開したフレーム数
@@ -69,6 +70,8 @@ public:
 
     void play();
     void stop();
+    /// 一時停止: フレーム送りだけ止め、表示は現在のフレームのまま
+    void pause();
 
     /**
      * @brief 動画ファイルを再オープンして検証する。有効なら再生を開始する。

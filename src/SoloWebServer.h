@@ -27,6 +27,7 @@
 
 #include "ConfigManager.h"
 #include "LEDManager.h"
+#include "NetworkManager.h"
 #include "SoloPlayer.h"
 
 namespace sastle {
@@ -43,7 +44,8 @@ public:
      * @param led     明るさ制御
      * @param port    リッスンポート
      */
-    bool begin(ConfigManager& config, SoloPlayer& player, LEDManager& led, uint16_t port);
+    bool begin(ConfigManager& config, SoloPlayer& player, LEDManager& led,
+               NetworkManager& net, uint16_t port);
     void end();
     bool isRunning() const { return _server != nullptr; }
 
@@ -52,12 +54,19 @@ public:
      */
     void loop();
 
+    /// Web UI (`/`) を一度でも返したか。LCD の案内表示の切り替えに使う。
+    bool uiServed() const { return _uiServed; }
+
 private:
     // esp_http_server ハンドラ (user_ctx = this)
     static esp_err_t onRoot(httpd_req_t* req);
+    static esp_err_t onConvert(httpd_req_t* req);
     static esp_err_t onStatus(httpd_req_t* req);
     static esp_err_t onPlay(httpd_req_t* req);
     static esp_err_t onStop(httpd_req_t* req);
+    static esp_err_t onPause(httpd_req_t* req);
+    static esp_err_t onWifi(httpd_req_t* req);
+
     static esp_err_t onBrightness(httpd_req_t* req);
     static esp_err_t onUpload(httpd_req_t* req);
     static esp_err_t onDelete(httpd_req_t* req);
@@ -76,10 +85,12 @@ private:
     // キャプティブポータル: 全ドメインを AP 自身の IP に解決し、未知パスは "/" へ 302。
     // iPhone は AP 接続直後に captive.apple.com を叩くので、そのまま UI が自動で開く。
     DNSServer _dns;
+    bool _uiServed = false;  ///< Web UI を一度でも返したか (LCD の案内 QR 切り替え用)
     bool _dnsStarted = false;
     ConfigManager* _config;
     SoloPlayer* _player;
     LEDManager* _led;
+    NetworkManager* _net;
 
     uint8_t* _rxBuf;              ///< 受信作業バッファ (ヒープ)
     char _jsonBuf[1024];          ///< 応答組み立て (ハンドラは httpd タスクで直列実行)

@@ -5,6 +5,7 @@
 
 #include "SoloPlayer.h"
 
+
 #include <esp_timer.h>
 
 namespace sastle {
@@ -105,7 +106,7 @@ bool SoloPlayer::startTask(uint8_t core, uint8_t priority, uint32_t stackSize) {
 
 void SoloPlayer::play() {
     if (xSemaphoreTake(_mutex, portMAX_DELAY) != pdTRUE) return;
-    if (_state == State::Stopped && _reader.isOpen()) {
+    if ((_state == State::Stopped || _state == State::Paused) && _reader.isOpen()) {
         _state = State::Playing;
         Serial.println("[SoloPlayer] play");
     }
@@ -114,9 +115,19 @@ void SoloPlayer::play() {
 
 void SoloPlayer::stop() {
     if (xSemaphoreTake(_mutex, portMAX_DELAY) != pdTRUE) return;
-    if (_state == State::Playing) {
+    if (_state == State::Playing || _state == State::Paused) {
         _state = State::Stopped;
         Serial.println("[SoloPlayer] stop");
+        if (_image) _image->publishBlack();  // 停止 = 消灯 (一時停止との違い)
+    }
+    xSemaphoreGive(_mutex);
+}
+
+void SoloPlayer::pause() {
+    if (xSemaphoreTake(_mutex, portMAX_DELAY) != pdTRUE) return;
+    if (_state == State::Playing) {
+        _state = State::Paused;  // tick() は Playing 以外では何もしないので表示は現在のフレームのまま
+        Serial.println("[SoloPlayer] pause");
     }
     xSemaphoreGive(_mutex);
 }
@@ -209,15 +220,17 @@ bool SoloPlayer::openVideoLocked() {
 
 void SoloPlayer::closeVideoLocked() {
     _reader.close();
-    if (_state == State::Playing || _state == State::Stopped) {
+    if (_state == State::Playing || _state == State::Paused || _state == State::Stopped) {
         _state = State::NoVideo;
     }
+    if (_image) _image->publishBlack();  // 動画が無い間は消灯
 }
 
 void SoloPlayer::setErrorLocked(const char* msg) {
     _reader.close();
     _state = State::Error;
     _lastError = msg;
+    if (_image) _image->publishBlack();  // エラー時も消灯
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +328,7 @@ const char* SoloPlayer::stateName() const {
     switch (_state) {
         case State::NoVideo:   return "no_video";
         case State::Playing:   return "playing";
+        case State::Paused:    return "paused";
         case State::Stopped:   return "stopped";
         case State::Uploading: return "uploading";
         case State::Error:     return "error";

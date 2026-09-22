@@ -164,7 +164,13 @@ void LCDManager::drawStatus(const LcdStatus& s) {
 }
 
 void LCDManager::drawWifiQr(const char* wifiQrText, const char* ssid, const char* url) {
-    if (!_initialized || !_debugEnabled || !wifiQrText) {
+    char line1[40];
+    snprintf(line1, sizeof(line1), "Wi-Fi %s", ssid ? ssid : "");
+    drawQr(wifiQrText, line1, url);
+}
+
+void LCDManager::drawQr(const char* qrText, const char* line1, const char* line2) {
+    if (!_initialized || !_debugEnabled || !qrText) {
         return;
     }
 #if BOARD_HAS_LCD
@@ -183,7 +189,7 @@ void LCDManager::drawWifiQr(const char* wifiQrText, const char* ssid, const char
     c.fillSprite(TFT_WHITE);  // QR は白地に黒が読み取りやすい
 
     // バイトモード / 誤り訂正 L の容量: v3=53, v4=78, v5=106, v6=134 文字
-    const size_t len = strlen(wifiQrText);
+    const size_t len = strlen(qrText);
     uint8_t version = 3;
     if (len > 106)     version = 6;
     else if (len > 78) version = 5;
@@ -191,14 +197,14 @@ void LCDManager::drawWifiQr(const char* wifiQrText, const char* ssid, const char
 
     // 128x128 のうち上 104px を QR に使い、下に SSID / URL を小さく出す
     const int32_t qrSize = 100;
-    c.qrcode(wifiQrText, (_lcdWidth - qrSize) / 2, 2, qrSize, version);
+    c.qrcode(qrText, (_lcdWidth - qrSize) / 2, 2, qrSize, version);
 
     c.setTextSize(1);
     c.setTextColor(TFT_BLACK);
     c.setCursor(4, 106);
-    c.printf("Wi-Fi %s", ssid ? ssid : "");
+    c.print(line1 ? line1 : "");
     c.setCursor(4, 117);
-    c.print(url ? url : "");
+    c.print(line2 ? line2 : "");
     // 生存表示 (点滅)
     c.fillCircle(_lcdWidth - 6, _lcdHeight - 6, 3, _heartbeat ? TFT_GREEN : TFT_WHITE);
 

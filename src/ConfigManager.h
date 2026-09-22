@@ -181,6 +181,10 @@ public:
     String getLayoutPath() { return doc["system"]["paths"]["layout"] | "/led_layouts-5strip.csv"; }
 
     // 起動オープニングパターン (LEDManager::playOpening)。スキップは enabled=false。
+    /// true = 接続時に OS の「ログイン」画面 (Captive Network Assistant) を開かせる。
+    /// 既定 false: iOS の CNA はファイル選択ダイアログが出ないため動画をアップロードできない。
+    /// false のときは OS の検出プローブに期待どおりの応答を返し、CNA を開かせない。
+    bool getSoloCaptivePortal() { return doc["solo"]["captive_portal"] | false; }
     bool getOpeningActionEnabled() { return doc["system"]["opening_action"]["enabled"] | true; }
     uint16_t getOpeningActionDurationMs() { return doc["system"]["opening_action"]["duration_ms"] | 1200; }
     

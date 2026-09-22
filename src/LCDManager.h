@@ -112,6 +112,14 @@ public:
     void drawWifiQr(const char* wifiQrText, const char* ssid, const char* url);
 
     /**
+     * @brief 任意の文字列を QR にして下 2 行のキャプションと一緒に出す
+     * @param qrText  QR にする文字列 (Wi-Fi 設定でも URL でも可)
+     * @param line1   1 行目 (太字相当の用途)
+     * @param line2   2 行目
+     */
+    void drawQr(const char* qrText, const char* line1, const char* line2);
+
+    /**
      * @brief 画面クリア
      * @param color 背景色 (RGB565)
      */

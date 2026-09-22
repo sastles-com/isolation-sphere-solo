@@ -21,6 +21,7 @@
   "solo": {
     "video_path": "/video.mjpg",
     "http_port": 80,
+    "captive_portal": false,
     "ap": {
       "ssid": "isolation-sphere",
       "password": "sphere-solo",

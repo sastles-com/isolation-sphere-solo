@@ -1,5 +1,15 @@
 #include "NetworkManager.h"
 
+#include <Preferences.h>
+
+namespace {
+// STA 資格情報の保管先 (NVS)。config.json に書かないのは、リポジトリに
+// 自宅 Wi-Fi のパスワードが混入するのを避けるため。
+constexpr const char* kNvsNamespace = "solo";
+constexpr const char* kKeySsid = "sta_ssid";
+constexpr const char* kKeyPass = "sta_pass";
+}  // namespace
+
 namespace sastle {
 
 NetworkManager::NetworkManager() : _started(false) {}
@@ -16,7 +26,8 @@ bool NetworkManager::beginSoftAP(const String& ssid, const String& password, con
         return false;
     }
 
-    WiFi.mode(WIFI_AP);
+    // STA 資格情報があれば最初から AP+STA で立ち上げる (後から mode を変えると AP が落ちる)
+    WiFi.mode(storedStaSsid().length() > 0 ? WIFI_AP_STA : WIFI_AP);
     // モデム省電力を無効化。省電力中はビーコン間でスリープし、AP としての応答が
     // 遅れて Web UI の操作感が落ちる。
     WiFi.setSleep(false);
@@ -43,6 +54,74 @@ bool NetworkManager::beginSoftAP(const String& ssid, const String& password, con
     Serial.printf("  AP IP:  %s\n", WiFi.softAPIP().toString().c_str());
     Serial.printf("  AP MAC: %s\n", WiFi.softAPmacAddress().c_str());
     return true;
+}
+
+bool NetworkManager::saveStaCredentials(const String& ssid, const String& password) {
+    Preferences prefs;
+    if (!prefs.begin(kNvsNamespace, false)) {
+        return false;
+    }
+    bool ok;
+    if (ssid.length() == 0) {
+        prefs.remove(kKeySsid);
+        prefs.remove(kKeyPass);
+        ok = true;
+    } else {
+        ok = prefs.putString(kKeySsid, ssid) > 0;
+        prefs.putString(kKeyPass, password);  // 空パスワード (オープン AP) も許容
+    }
+    prefs.end();
+    return ok;
+}
+
+String NetworkManager::storedStaSsid() {
+    Preferences prefs;
+    if (!prefs.begin(kNvsNamespace, true)) {
+        return String();
+    }
+    String ssid = prefs.getString(kKeySsid, "");
+    prefs.end();
+    return ssid;
+}
+
+bool NetworkManager::beginStaFromStore(const String& hostname) {
+    Preferences prefs;
+    String ssid, pass;
+    if (prefs.begin(kNvsNamespace, true)) {
+        ssid = prefs.getString(kKeySsid, "");
+        pass = prefs.getString(kKeyPass, "");
+        prefs.end();
+    }
+    if (ssid.length() == 0) {
+        Serial.println("STA: not configured (POST /api/wifi to enable OTA over LAN)");
+        return false;
+    }
+    _staSsid = ssid;
+    _staEnabled = true;
+    if (hostname.length() > 0) {
+        WiFi.setHostname(hostname.c_str());
+    }
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(ssid.c_str(), pass.length() ? pass.c_str() : nullptr);
+    Serial.printf("STA: connecting to \"%s\" (non-blocking; AP stays up)\n", ssid.c_str());
+    return true;
+}
+
+void NetworkManager::poll() {
+    if (!_staEnabled) {
+        return;
+    }
+    const bool now = (WiFi.status() == WL_CONNECTED);
+    if (now == _staWasConnected) {
+        return;
+    }
+    _staWasConnected = now;
+    if (now) {
+        Serial.printf("STA: connected to \"%s\"  IP=%s  (OTA: pio run -e atoms3r_lan_ota -t upload)\n",
+                      _staSsid.c_str(), WiFi.localIP().toString().c_str());
+    } else {
+        Serial.printf("STA: disconnected from \"%s\" (auto-reconnect enabled)\n", _staSsid.c_str());
+    }
 }
 
 void NetworkManager::stop() {

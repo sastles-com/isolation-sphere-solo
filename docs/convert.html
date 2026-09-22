@@ -1,0 +1,326 @@
+<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>solo 動画コンバータ</title>
+<!--
+  任意の動画 (iPhone のカメラ動画など) を solo モードが受理する raw MJPEG に変換する。
+  変換は全てブラウザ内 (video のハードウェアデコーダ + canvas) で行い、球体側の負荷はゼロ。
+
+  出力形式 (src/JpegScan.h の受理条件):
+    - Baseline JPEG (SOF0) を区切りなしで連結しただけの raw MJPEG。コンテナ無し
+    - 全フレーム 320x160 / 1フレーム <= 64KiB
+    - ファイルに fps 情報は入らない (SoloPlayer は kSoloFps=10 固定で再生する)
+      => 「10fps にする」= 元動画のタイムラインを 100ms 刻みでサンプリングすること
+  アスペクト比は 2:1 への押し潰し (元フレーム全体を 320x160 に伸縮) で固定。
+  外部リソース依存なし = そのままファームウェアに埋め込める。
+-->
+<style>
+:root{color-scheme:dark}
+body{font-family:-apple-system,system-ui,sans-serif;margin:0 auto;padding:16px;max-width:520px;background:#111;color:#eee}
+h1{font-size:20px;margin:8px 0 16px}h1 small{color:#888;font-weight:normal;font-size:13px;display:block;margin-top:2px}
+.card{background:#1d1d1f;border-radius:12px;padding:14px;margin-bottom:14px}
+.row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:6px 0}
+.k{color:#999;font-size:13px}.v{font-variant-numeric:tabular-nums;text-align:right}
+button{font-size:16px;padding:12px 16px;border:0;border-radius:10px;background:#2c7be5;color:#fff;flex:1}
+button.gray{background:#444}button:disabled{opacity:.4}
+input[type=range]{width:100%}
+/* iOS 既定の「ファイルを選択」は小さく見づらいので、ネイティブボタンを擬似要素で大きくする */
+input[type=file]{width:100%;font-size:16px;padding:10px;border:1px dashed #555;border-radius:10px;background:#111;color:#aaa;box-sizing:border-box}
+input[type=file]::file-selector-button{font-size:17px;font-weight:bold;padding:14px 18px;margin-right:12px;border:0;border-radius:10px;background:#2c7be5;color:#fff}
+input[type=file]::-webkit-file-upload-button{font-size:17px;font-weight:bold;padding:14px 18px;margin-right:12px;border:0;border-radius:10px;background:#2c7be5;color:#fff}
+progress{width:100%;height:14px}
+canvas{width:100%;height:auto;border-radius:8px;background:#000;display:block;margin:6px 0}
+small{color:#888}
+.msg{min-height:1.2em;color:#f5b041;font-size:13px}
+</style></head><body>
+<h1>solo 動画コンバータ<small>320×160 / 10fps / raw MJPEG に変換してアップロードします</small></h1>
+<p id="back" hidden><a href="/" style="color:#5dade2">← 操作画面へ戻る</a></p>
+
+<div class="card">
+ <div class="k">1. 動画を選ぶ</div>
+ <p><small>iPhone のカメラ動画をそのまま選べます。変換はこの端末のブラウザ内で行われます。</small></p>
+ <input id="file" type="file">
+ <p><small>すでに変換済みの <b>.mjpg</b> を選んだ場合は変換を飛ばしてそのままアップロードします。</small></p>
+ <div class="row"><span class="k">元動画</span><span id="src" class="v">-</span></div>
+</div>
+
+<div class="card" id="cfg" hidden>
+ <div class="k">2. 範囲と画質を決める</div>
+ <div class="row"><span class="k">開始位置</span><span id="stv" class="v">-</span></div>
+ <input id="start" type="range" min="0" max="10" step="0.1" value="0">
+ <div class="row"><span class="k">長さ</span><span id="lenv" class="v">-</span></div>
+ <input id="len" type="range" min="0.5" max="60" step="0.5" value="10">
+ <div class="row"><span class="k">画質</span><span id="qv" class="v">-</span></div>
+ <input id="q" type="range" min="0.3" max="0.95" step="0.05" value="0.75">
+ <div class="row"><span class="k">フレーム数</span><span id="nf" class="v">-</span></div>
+ <div class="row"><span class="k">推定サイズ</span><span id="est" class="v">-</span></div>
+ <div id="warn" class="msg"></div>
+ <div class="k" style="margin-top:10px">プレビュー (2:1 に押し潰した結果)</div>
+ <canvas id="pv" width="320" height="160"></canvas>
+ <div class="row"><button id="go">変換する</button></div>
+ <progress id="prog" value="0" max="100" hidden></progress>
+ <div id="pmsg" class="msg"></div>
+</div>
+
+<div class="card" id="out" hidden>
+ <div class="k">3. 結果</div>
+ <div class="row"><span class="k">フレーム</span><span id="rf" class="v">-</span></div>
+ <div class="row"><span class="k">ファイルサイズ</span><span id="rs" class="v">-</span></div>
+ <div class="row"><span class="k">最大フレーム</span><span id="rm" class="v">-</span></div>
+ <div id="msg" class="msg"></div>
+ <div class="row"><button id="save">保存 (video.mjpg)</button><button id="share" class="gray" hidden>共有</button></div>
+ <div class="row"><button id="up" hidden>球体へアップロード</button></div>
+ <progress id="uprog" value="0" max="100" hidden></progress>
+ <p id="hint" hidden><small>保存したファイルは、球体の AP (isolation-sphere) に接続してから <b>http://192.168.4.1/</b> を Safari で開き、「動画アップロード」から選んでください。</small></p>
+</div>
+
+<video id="v" playsinline muted preload="metadata" hidden></video>
+
+<script>
+const $=id=>document.getElementById(id);
+const W=320,H=160,FPS=10,STEP=1/FPS,MAX_FRAME=65536;
+const DEFAULT_CAP=Math.floor(3.9*1048576);  // LittleFS 3.94MB - 同梱物。/api/status が読めれば実値に差し替える
+const fmt=n=>n>=1048576?(n/1048576).toFixed(2)+' MB':n>=1024?(n/1024).toFixed(1)+' KB':n+' B';
+const v=$('v'),pv=$('pv'),ctx=pv.getContext('2d');
+let cap=DEFAULT_CAP,apiOk=false,perFrame=0,result=null,busy=false,probeTimer=null;
+
+// 同一オリジンで球体が配信している場合だけ、実際の空き容量と直接アップロードを使う
+(async()=>{try{
+  const r=await fetch('/api/status',{cache:'no-store'});
+  if(r.ok){const s=await r.json();if(s&&s.fs){apiOk=true;cap=s.fs.max_upload;$('back').hidden=false;update()}}
+}catch(_){}})();
+
+// --- 入力 -------------------------------------------------------------------
+$('file').onchange=async()=>{
+  const f=$('file').files[0];if(!f)return;
+  result=null;$('out').hidden=true;$('pmsg').textContent='';perFrame=0;$('cfg').hidden=true;
+  // すでに raw MJPEG なら変換せずそのまま扱う (<video> では再生できないので早期に分岐する)
+  const head=new Uint8Array(await f.slice(0,3).arrayBuffer());
+  if(/\.mjpe?g$/i.test(f.name)||(head[0]===0xFF&&head[1]===0xD8&&head[2]===0xFF)){
+    $('src').textContent=`${f.name} / ${fmt(f.size)} (変換済み)`;
+    const scan=await scanMjpeg(f);
+    if(!scan.ok){$('msg').textContent=scan.error;$('out').hidden=false;$('up').hidden=true;$('save').disabled=true;return}
+    result=f; show(scan.frames,scan.maxFrame);
+    $('pmsg').textContent='変換は不要です。そのままアップロードできます';
+    return;
+  }
+  v.src=URL.createObjectURL(f);
+  v.onerror=()=>{$('src').textContent='この形式は再生できません'};
+  v.onloadedmetadata=()=>{
+    const d=v.duration;
+    if(!isFinite(d)||d<=0){$('src').textContent='長さを取得できません';return}
+    $('src').textContent=`${v.videoWidth}×${v.videoHeight} / ${d.toFixed(1)} s / ${fmt(f.size)}`;
+    $('start').max=Math.max(0,d-0.5).toFixed(1);$('start').value=0;
+    $('len').max=Math.min(d,120).toFixed(1);$('len').value=Math.min(d,10).toFixed(1);
+    $('cfg').hidden=false;update();probeSoon();
+  };
+};
+for(const id of ['start','len']) $(id).oninput=()=>{update();probeSoon()};
+$('q').oninput=()=>{update();probeSoon()};
+
+// raw MJPEG を軽く走査して、ファーム側の受理条件 (全フレーム 320x160 / 1フレーム 64KiB 以下 /
+// SOI..EOI の連結で末尾にゴミが無い) を満たすか先に確かめる。アップロードして
+// 「corrupt JPEG structure」で弾かれるのを防ぐ。
+async function scanMjpeg(file){
+  const b=new Uint8Array(await file.arrayBuffer());
+  let pos=0,frames=0,maxFrame=0;
+  while(pos<b.length){
+    if(!(b[pos]===0xFF&&b[pos+1]===0xD8)) return {ok:false,error:`${pos} バイト目が JPEG の先頭 (FFD8) ではありません`};
+    // セグメントを辿って SOF から解像度を読み、SOS 以降は EOI を探す
+    let p=pos+2,w=0,h=0,baseline=false,sawSOS=false;
+    while(p+3<b.length){
+      if(b[p]!==0xFF) return {ok:false,error:`${p} バイト目のマーカー境界が壊れています`};
+      const m=b[p+1];
+      if(m===0xD9) break;
+      if(m===0x01||(m>=0xD0&&m<=0xD7)){p+=2;continue}
+      const len=(b[p+2]<<8)|b[p+3];
+      if(m>=0xC0&&m<=0xCF&&m!==0xC4&&m!==0xC8&&m!==0xCC){
+        h=(b[p+5]<<8)|b[p+6]; w=(b[p+7]<<8)|b[p+8]; baseline=(m===0xC0);
+      }
+      if(m===0xDA){sawSOS=true;p+=2+len;
+        while(p+1<b.length){ // エントロピー符号: FF00 とリスタートマーカーは本体
+          if(b[p]!==0xFF){p++;continue}
+          const n=b[p+1];
+          if(n===0x00||(n>=0xD0&&n<=0xD7)){p+=2;continue}
+          if(n===0xFF){p++;continue}
+          break;
+        }
+        continue;
+      }
+      p+=2+len;
+    }
+    if(!sawSOS) return {ok:false,error:`フレーム ${frames} に画像データがありません`};
+    if(!baseline) return {ok:false,error:`フレーム ${frames} が Baseline JPEG ではありません (progressive は不可)`};
+    if(w!==W||h!==H) return {ok:false,error:`フレーム ${frames} の解像度が ${w}×${h} です (${W}×${H} が必要)`};
+    if(p+1>=b.length||b[p+1]!==0xD9) return {ok:false,error:`フレーム ${frames} が途中で切れています`};
+    const len=p+2-pos;
+    if(len>MAX_FRAME) return {ok:false,error:`フレーム ${frames} が ${fmt(len)} で上限 ${fmt(MAX_FRAME)} を超えています`};
+    if(len>maxFrame) maxFrame=len;
+    pos+=len; frames++;
+  }
+  if(!frames) return {ok:false,error:'フレームがありません'};
+  return {ok:true,frames,maxFrame};
+}
+
+function update(){
+  const d=v.duration||0;
+  let st=+$('start').value,ln=+$('len').value;
+  if(st+ln>d){ln=Math.max(0.5,d-st);$('len').value=ln.toFixed(1)}
+  $('stv').textContent=st.toFixed(1)+' s';
+  $('lenv').textContent=ln.toFixed(1)+' s';
+  $('qv').textContent=(+$('q').value).toFixed(2);
+  const n=frameCount();
+  $('nf').textContent=`${n} f (10fps)`;
+  if(!perFrame){$('est').textContent='-';return}
+  const total=n*perFrame;
+  $('est').textContent=`${fmt(total)} (1f 約 ${fmt(perFrame)})`;
+  const w=[];
+  if(perFrame>MAX_FRAME) w.push('1フレームが 64KB を超えています。画質を下げてください');
+  if(total>cap) w.push(`容量オーバー: 上限 ${fmt(cap)}。長さを ${(cap/perFrame/FPS).toFixed(1)} 秒以下にするか画質を下げてください`);
+  $('warn').textContent=w.join(' / ');
+}
+const frameCount=()=>Math.max(1,Math.floor((+$('len').value)*FPS));
+
+// --- フレーム取り出しと符号化 -----------------------------------------------
+// 2:1 への押し潰し: 元フレーム全体を切り取らずに 320x160 へ伸縮する
+function draw(){ctx.drawImage(v,0,0,v.videoWidth,v.videoHeight,0,0,W,H)}
+// canvas の JPEG 出力は Baseline (SOF0) なので JpegScan がそのまま受理する
+function encode(){return new Promise((res,rej)=>pv.toBlob(b=>b?res(b):rej(new Error('JPEG encode failed')),'image/jpeg',+$('q').value))}
+
+function seek(t){
+  return new Promise((res,rej)=>{
+    const on=()=>{clearTimeout(tm);v.removeEventListener('seeked',on);res()};
+    const tm=setTimeout(()=>{v.removeEventListener('seeked',on);rej(new Error('seek timeout'))},5000);
+    v.addEventListener('seeked',on);
+    v.currentTime=Math.min(t,Math.max(0,v.duration-0.02));
+  });
+}
+
+function probeSoon(){clearTimeout(probeTimer);probeTimer=setTimeout(probe,250)}
+// 実際に1フレーム符号化して 1f あたりのバイト数を測る (推定サイズとプレビューを兼ねる)
+async function probe(){
+  if(busy||!v.duration)return;
+  try{
+    await seek(+$('start').value+(+$('len').value)/2);
+    draw();
+    perFrame=(await encode()).size;
+    update();
+  }catch(_){}
+}
+
+// requestVideoFrameCallback: 再生しながら 100ms 刻みで最も近いフレームを拾う (実時間で完了)
+function captureRVFC(st,end,total,jobs,onProg){
+  return new Promise((res,rej)=>{
+    let next=st,done=false;
+    const finish=()=>{if(done)return;done=true;v.removeEventListener('ended',finish);try{v.pause()}catch(_){}res()};
+    v.addEventListener('ended',finish);
+    const cb=(now,meta)=>{
+      if(done)return;
+      const m=meta.mediaTime;
+      if(m+1e-3>=next){
+        draw();
+        let blob=null;  // 取りこぼした時刻スロットは同じフレームで埋める (フレーム数=時間を保つ)
+        while(next<=m+1e-3&&jobs.length<total){
+          if(!blob)blob=encode();
+          jobs.push(blob);next+=STEP;
+        }
+        onProg();
+      }
+      if(jobs.length>=total||v.ended||v.currentTime>=end){finish();return}
+      v.requestVideoFrameCallback(cb);
+    };
+    seek(st).catch(()=>{}).then(()=>{
+      v.playbackRate=2;  // mediaTime 基準なので倍速でもタイミングは崩れない
+      v.requestVideoFrameCallback(cb);
+      v.play().catch(rej);
+    });
+  });
+}
+
+// フォールバック: 1フレームずつシークする (遅いが確実)
+async function captureSeek(st,end,total,jobs,onProg){
+  for(let i=0;i<total;i++){
+    const t=st+i*STEP;
+    if(t>=v.duration)break;
+    await seek(t);draw();jobs.push(encode());onProg();
+  }
+}
+
+$('go').onclick=async()=>{
+  if(busy||!v.duration)return;
+  busy=true;$('go').disabled=true;$('prog').hidden=false;$('prog').value=0;$('out').hidden=true;
+  const st=+$('start').value,ln=+$('len').value,total=frameCount(),end=st+ln;
+  const jobs=[];
+  const onProg=()=>{$('prog').value=jobs.length/total*100};
+  const rvfc='requestVideoFrameCallback' in HTMLVideoElement.prototype;
+  $('pmsg').textContent=rvfc?'変換中…':'変換中… (シーク方式。時間がかかります)';
+  const t0=performance.now();
+  try{
+    if(rvfc) await captureRVFC(st,end,total,jobs,onProg);
+    else await captureSeek(st,end,total,jobs,onProg);
+    if(!jobs.length) throw new Error('フレームを取得できませんでした');
+    const blobs=await Promise.all(jobs);
+    const maxF=blobs.reduce((m,b)=>Math.max(m,b.size),0);
+    result=new Blob(blobs,{type:'application/octet-stream'});  // 連結するだけで raw MJPEG になる
+    $('pmsg').textContent=`変換 ${((performance.now()-t0)/1000).toFixed(1)} 秒`;
+    show(blobs.length,maxF);
+  }catch(e){
+    $('pmsg').textContent='変換に失敗しました: '+e.message;
+  }finally{
+    busy=false;$('go').disabled=false;$('prog').hidden=true;try{v.pause()}catch(_){}v.playbackRate=1;
+  }
+};
+
+// --- 結果 -------------------------------------------------------------------
+function show(n,maxF){
+  $('out').hidden=false;$('up').hidden=false;$('save').disabled=false;
+  $('rf').textContent=`${n} f / ${(n/FPS).toFixed(1)} s`;
+  $('rs').textContent=`${fmt(result.size)} (上限 ${fmt(cap)})`;
+  $('rm').textContent=`${fmt(maxF)} (上限 ${fmt(MAX_FRAME)})`;
+  const m=[];
+  if(maxF>MAX_FRAME) m.push('1フレームが上限を超えています。画質を下げて再変換してください');
+  if(result.size>cap) m.push('容量オーバーです。長さを短くするか画質を下げてください');
+  $('msg').textContent=m.join(' / ');
+  const ok=maxF<=MAX_FRAME&&result.size<=cap;
+  $('up').hidden=!apiOk;$('up').disabled=!ok;
+  $('hint').hidden=apiOk;
+  if(navigator.canShare){
+    try{
+      const f=new File([result],'video.mjpg',{type:'application/octet-stream'});
+      $('share').hidden=!navigator.canShare({files:[f]});
+    }catch(_){$('share').hidden=true}
+  }
+}
+
+$('save').onclick=()=>{
+  if(!result)return;
+  const u=URL.createObjectURL(result),a=document.createElement('a');
+  a.href=u;a.download='video.mjpg';a.click();
+  setTimeout(()=>URL.revokeObjectURL(u),10000);
+};
+$('share').onclick=async()=>{
+  if(!result)return;
+  try{await navigator.share({files:[new File([result],'video.mjpg',{type:'application/octet-stream'})]})}
+  catch(_){}
+};
+$('up').onclick=()=>{
+  if(!result)return;
+  $('up').disabled=true;$('uprog').hidden=false;$('uprog').value=0;$('msg').textContent=`送信中 ${fmt(result.size)}`;
+  const x=new XMLHttpRequest();
+  x.open('POST','/api/video');x.setRequestHeader('Content-Type','application/octet-stream');x.timeout=600000;
+  x.upload.onprogress=e=>{if(e.lengthComputable)$('uprog').value=e.loaded/e.total*100};
+  x.onload=()=>{
+    $('uprog').hidden=true;$('up').disabled=false;
+    let j={};try{j=JSON.parse(x.responseText)}catch(_){}
+    if(x.status===200){
+      // 成功したら操作画面へ戻る (球体は先頭から再生を始めている)。
+      // 何が入ったかを一瞬見せてから遷移する。失敗時は理由を読めるよう留まる。
+      $('msg').textContent=`完了: ${j.frames} フレーム / ${(j.duration_s||0).toFixed(1)} 秒 — 操作画面へ戻ります`;
+      setTimeout(()=>{location.href='/'},1200);
+    }else{
+      $('msg').textContent=`失敗: ${j.error||('HTTP '+x.status)}`;
+    }
+  };
+  x.onerror=x.ontimeout=()=>{$('uprog').hidden=true;$('up').disabled=false;$('msg').textContent='送信エラー (接続が切れました)'};
+  x.send(result);
+};
+</script></body></html>

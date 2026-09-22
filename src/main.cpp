@@ -23,6 +23,8 @@
 #include "LEDManager.h"
 #include "LCDManager.h"
 #include "OtaManager.h"
+#include "Settings.h"
+
 #include "SoloPlayer.h"
 #include "SoloWebServer.h"
 
@@ -98,7 +100,11 @@ void setup() {
         sound.playEffect(SoundEffect::STARTUP);
     }
 
-    delay(2000);  // シリアルモニタ接続待ち
+    // シリアルモニタ接続待ち。USB ホストが繋がっているときだけ短く待つ (起動ログの先頭を
+    // 取りこぼさないため)。電池駆動 (ホスト無し) では待たない。
+    if (Serial.isConnected()) {
+        delay(300);
+    }
 
     if (!soundReady) {
         sastle::Log.println("Sound initialization failed (continuing without sound)");
@@ -135,19 +141,27 @@ void setup() {
 
     // LittleFS初期化
     sastle::Log.println("\n=== Initializing LittleFS ===");
-    if (!FileManager::begin()) {
-        sastle::Log.println("FileManager initialization FAILED!");
-        while(1) delay(1000);
+    // LittleFS が壊れていても停止しない。SoftAP と OTA を必ず立ち上げ、無線で書き戻せる
+    // 状態を保つ (組み立て後は USB 端子に触れないため、ここで止まると復旧手段が無くなる)。
+    const bool fsReady = FileManager::begin();
+    if (!fsReady) {
+        sastle::Log.println("FileManager initialization FAILED "
+                            "(no video / uploads disabled, but SoftAP+OTA will start)");
+    } else {
+        FileManager::printInfo();
     }
-    FileManager::printInfo();
 
     // ConfigManager初期化とロード
     sastle::Log.println("\n=== Loading Configuration ===");
-    if (!config.loadConfig("/config.json")) {
-        sastle::Log.println("Failed to load config!");
-        while(1) delay(1000);
+    // 同様に、設定が読めなくても停止しない。ConfigManager の各 getter は
+    // コンパイル時の既定値 (320x160 / SoftAP 既定 SSID など) を返す。
+    if (!fsReady || !config.loadConfig("/config.json")) {
+        sastle::Log.println("Failed to load config (using compiled-in defaults)");
     }
     config.printConfig();
+
+    // UI で変えた設定 (明るさ等) を NVS から復元する
+    sastle::Settings::begin();
 
     // SoftAP を立てる。失敗しても停止しない (動画があれば iPhone 無しでも
     // 自動再生する要件)。
@@ -165,6 +179,15 @@ void setup() {
     g_wifiQrText = NetworkManager::wifiQrText(soloCfg.ap_ssid, soloCfg.ap_password);
     g_uiUrl = "http://" + apIp.toString() + "/";
     sastle::Log.printf("[SOLO] Wi-Fi QR: %s  UI: %s\n", g_wifiQrText.c_str(), g_uiUrl.c_str());
+
+    // 任意の STA 併用 (AP+STA)。資格情報は NVS に置く (Web UI の「LAN 接続」から設定)。
+    // 目的は OTA: 普段の LAN に居れば PC の Wi-Fi を切り替えずに espota できる。
+    network.beginStaFromStore(soloCfg.ap_ssid);
+
+    // OTA (espota) 初期化: AP が立った直後に受け口を開く。これ以降の初期化
+    // (IMU / LED / 再生 / Web) で失敗・停止しても、無線での書き戻しは生き残る。
+    // stopRenderTask() は _taskRunning ガードがあるため未初期化でも安全。
+    ota.begin(&ledManager);
 
     // IMU初期化前に I2C バスを走査 (BNO055 の有無を切り分けるため)
     scanI2cBus(kImuI2cSda, kImuI2cScl);
@@ -214,7 +237,7 @@ void setup() {
             }
 
             // config の params.brightness (0-100%) を LED 輝度 (0-255) へ適用
-            ledManager.setBrightness((uint8_t)map(config.getParamBrightness(), 0, 100, 0, 255));
+            ledManager.setBrightness((uint8_t)map(sastle::Settings::brightness(config.getParamBrightness()), 0, 100, 0, 255));
 
             // レンダリングタスク開始 (Core 1)
             if (!ledManager.startRenderTask(1, 2, 8192)) {
@@ -235,15 +258,11 @@ void setup() {
             sastle::Log.println("SoloPlayer initialization failed");
         }
         if (network.isSoftAP()) {
-            if (!soloWeb.begin(config, soloPlayer, ledManager, config.getSoloHttpPort())) {
+            if (!soloWeb.begin(config, soloPlayer, ledManager, network, config.getSoloHttpPort())) {
                 sastle::Log.println("Web server failed to start");
             }
         }
     }
-
-    // OTA (espota) 初期化: AP 経由で無線書き込みを受け付ける。
-    // OTA 開始時はレンダリングタスクを停止する (更新中は描画停止で可)。
-    ota.begin(&ledManager);
 
     sastle::Log.println("\n=== Setup Complete ===");
 }
@@ -356,6 +375,7 @@ void loop() {
     ota.handle();
 
     // キャプティブポータル DNS の応答と、HTTP 経由の再起動要求の実行
+    network.poll();   // STA 接続状態の変化をログに出す
     soloWeb.loop();
 
     // シリアルコンソール
@@ -366,6 +386,10 @@ void loop() {
         if (network.clientCount() == 0) {
             // 端末が1台も繋がっていない間は接続用 QR を優先表示する
             lcdManager.drawWifiQr(g_wifiQrText.c_str(), g_apSsid.c_str(), g_uiUrl.c_str());
+        } else if (!soloWeb.uiServed()) {
+            // 接続済みだが UI をまだ開いていない: カメラで読むと Safari が開く URL QR を出す。
+            // (キャプティブポータルを抑止しているため、UI は利用者が自分で開く)
+            lcdManager.drawQr(g_uiUrl.c_str(), "Camera で読む", g_uiUrl.c_str());
         } else {
             // 再生中は映像、停止中/動画なしは STANDBY 画面
             static uint32_t s_lastFrames = 0;

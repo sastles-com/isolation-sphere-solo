@@ -71,6 +71,14 @@ public:
     bool submitJpegFrame(const uint8_t* jpeg, size_t size);
 
     /**
+     * @brief 全画素 0 のフレームを公開する (停止・動画削除・エラー時に LED を消灯させる)
+     * @note 描画タスクは publish 済みフレームを再マッピングし続けるため、停止しても
+     *       最後の映像が残る。呼び出し側は SoloPlayer のミューテックスを保持していること
+     *       (デコードと同じバッファに書くため)。
+     */
+    void publishBlack();
+
+    /**
      * @brief 指定座標のピクセル色を取得 (RGB)
      * @param x X座標 (0 ~ width-1)
      * @param y Y座標 (0 ~ height-1)

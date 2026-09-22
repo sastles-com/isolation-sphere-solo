@@ -6,6 +6,9 @@
 #include "SoloWebServer.h"
 
 #include <ArduinoJson.h>
+
+#include "ConvertPage.h"
+#include "Settings.h"
 #include <LittleFS.h>
 #include <string.h>
 
@@ -21,6 +24,8 @@ constexpr int kRecvTimeoutRetries = 5;
 
 // ---------------------------------------------------------------------------
 // 埋め込み Web UI (iPhone Safari 向け最小構成。外部リソース依存なし)
+// NOTE: <input type=file> に accept を付けない。iOS は未知の拡張子 (.mjpg) を accept に含めると
+//       「ファイル」アプリで該当ファイルがグレーアウトして選べなくなる。形式検証はサーバ側で行う。
 // ---------------------------------------------------------------------------
 const char kIndexHtml[] PROGMEM = R"HTML(<!doctype html><html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -34,10 +39,19 @@ h1{font-size:20px;margin:8px 0 16px}h1 small{color:#888;font-weight:normal}
 .k{color:#999;font-size:13px}.v{font-variant-numeric:tabular-nums;text-align:right}
 button{font-size:16px;padding:12px 16px;border:0;border-radius:10px;background:#2c7be5;color:#fff;flex:1}
 button.warn{background:#c0392b}button.gray{background:#444}button:disabled{opacity:.4}
-input[type=range]{width:100%}input[type=file]{width:100%;font-size:14px}
+a.btnlink{display:block;flex:1;text-align:center;text-decoration:none;font-size:16px;font-weight:bold;padding:14px 16px;border-radius:10px;background:#2c7be5;color:#fff}
+input[type=range]{width:100%}
+/* ファイル選択: iOS 既定の「ファイルを選択」は小さく見づらいので、擬似要素で
+   ネイティブボタンを大きくする。DOM 構造は変えない (透明な要素を重ねると
+   端末によってタップが通らなくなるため)。::file-selector-button は標準名、
+   ::-webkit-file-upload-button は Safari の旧名で、両方指定しておく。 */
+input[type=file]{width:100%;font-size:16px;padding:10px;border:1px dashed #555;border-radius:10px;background:#111;color:#aaa;box-sizing:border-box}
+input[type=file]::file-selector-button{font-size:17px;font-weight:bold;padding:14px 18px;margin-right:12px;border:0;border-radius:10px;background:#2c7be5;color:#fff}
+input[type=file]::-webkit-file-upload-button{font-size:17px;font-weight:bold;padding:14px 18px;margin-right:12px;border:0;border-radius:10px;background:#2c7be5;color:#fff}
+input[type=text],input[type=password]{width:100%;font-size:16px;padding:10px;margin:4px 0;border-radius:8px;border:1px solid #444;background:#111;color:#eee;box-sizing:border-box}
 progress{width:100%;height:14px}
 .st{display:inline-block;padding:2px 10px;border-radius:999px;font-size:13px;background:#333}
-.st.playing{background:#1e8449}.st.error{background:#c0392b}.st.uploading{background:#d68910}
+.st.playing{background:#1e8449}.st.paused{background:#7d6608}.st.error{background:#c0392b}.st.uploading{background:#d68910}
 small{color:#888}#msg{min-height:1.2em;color:#f5b041;font-size:14px;word-break:break-all}
 </style></head><body>
 <h1>Isolation Sphere <small>solo</small></h1>
@@ -48,21 +62,30 @@ small{color:#888}#msg{min-height:1.2em;color:#f5b041;font-size:14px;word-break:b
  <div class="row"><span class="k">再生</span><span id="stats" class="v">-</span></div>
  <div class="row"><span class="k">空き容量</span><span id="fs" class="v">-</span></div>
  <div id="msg"></div>
- <div class="row"><button id="play">再生</button><button id="stop" class="gray">停止</button></div>
+ <div class="row"><button id="play">再生</button><button id="pause" class="gray">一時停止</button><button id="stop" class="gray">停止</button></div>
+ <small>一時停止は現在のフレームを表示したまま止まり、停止は消灯します。どちらも再生で続きから再開します。</small>
 </div>
 <div class="card">
  <div class="row"><span class="k">明るさ</span><span id="bval" class="v">-</span></div>
  <input id="bri" type="range" min="0" max="100" step="1">
 </div>
 <div class="card">
- <div class="k">動画アップロード (320×160 / 10fps / raw MJPEG)</div>
+ <div class="k">動画の入れ替え</div>
+ <p><small>下のボタンから専用ページを開きます。iPhone で撮った動画をその場で 320×160 / 10fps に変換して、そのまま投入できます (変換済みの .mjpg もそのページから入れられます)。ファイルを選ぶのは 1 回だけです。</small></p>
  <p><small>アップロード中は再生が止まり、成功すると新しい動画を先頭から再生します。空き容量が足りない場合は現在の動画を先に削除してから受信します (失敗すると「動画なし」になり再アップロードできます)。</small></p>
- <input id="file" type="file" accept=".mjpg,.mjpeg,video/x-motion-jpeg,application/octet-stream">
- <div class="row"><button id="up">アップロード</button><button id="del" class="warn">削除</button></div>
- <progress id="prog" value="0" max="100" hidden></progress>
+ <div class="row"><a id="conv" class="btnlink" href="/convert">動画を選ぶ (変換してアップロード)</a></div>
+ <div class="row"><button id="del" class="warn">保存済み動画を削除</button></div>
+</div>
+<div class="card">
+ <div class="k">LAN 接続 (開発用 / 任意)</div>
+ <p><small>普段の Wi-Fi にも同時接続します。PC の Wi-Fi を切り替えずに OTA 書き込みができるようになります。SSID を空で保存すると無効化します。反映は再起動後です。</small></p>
+ <input id="ssid" type="text" placeholder="SSID" autocapitalize="off" autocorrect="off" spellcheck="false">
+ <input id="pass" type="password" placeholder="パスワード" autocapitalize="off" autocorrect="off" spellcheck="false">
+ <div class="row"><button id="wifi">保存</button></div>
 </div>
 <div class="card">
  <div class="row"><span class="k">デバイス</span><span id="dev" class="v">-</span></div>
+ <div class="row"><span class="k">LAN (STA)</span><span id="sta" class="v">-</span></div>
  <div class="row"><button id="reboot" class="gray">再起動</button></div>
 </div>
 <script>
@@ -78,22 +101,22 @@ async function refresh(){if(busy)return;try{const r=await fetch('/api/status',{c
  $('fs').textContent=`${fmt(s.fs.free)} (最大 ${fmt(s.fs.max_upload)})`;
  if(document.activeElement!==$('bri')){$('bri').value=s.brightness;$('bval').textContent=s.brightness+'%'}
  $('dev').textContent=`${s.device} / AP ${s.ap.ssid} (${s.ap.clients}) / up ${s.uptime_s}s`;
- $('play').disabled=s.state!=='stopped';$('stop').disabled=s.state!=='playing';
- $('up').disabled=s.state==='uploading';$('del').disabled=!s.video.present||s.state==='uploading';
+ if(s.sta){$('sta').textContent=!s.sta.enabled?'未設定':(s.sta.connected?`${s.sta.ssid} ${s.sta.ip}`:`${s.sta.ssid} 接続中…`);
+  if(document.activeElement!==$('ssid')&&!$('ssid').value&&s.sta.ssid)$('ssid').placeholder=s.sta.ssid}
+ $('play').disabled=!(s.state==='stopped'||s.state==='paused');$('pause').disabled=s.state!=='playing';$('stop').disabled=!(s.state==='playing'||s.state==='paused');
+ $('del').disabled=!s.video.present||s.state==='uploading';
+ $('conv').style.opacity=s.state==='uploading'?.4:1;
 }catch(e){$('state').textContent='接続エラー';$('state').className='st error'}}
 $('play').onclick=()=>api('/api/play').then(refresh).catch(e=>say(e.message));
 $('stop').onclick=()=>api('/api/stop').then(refresh).catch(e=>say(e.message));
+$('pause').onclick=()=>api('/api/pause').then(refresh).catch(e=>say(e.message));
 $('bri').oninput=e=>{$('bval').textContent=e.target.value+'%';clearTimeout(briTimer);briTimer=setTimeout(()=>api('/api/brightness',{value:+e.target.value}).catch(e=>say(e.message)),150)};
 $('del').onclick=()=>{if(confirm('保存済み動画を削除しますか？'))api('/api/video/delete').then(refresh).catch(e=>say(e.message))};
 $('reboot').onclick=()=>{if(confirm('再起動しますか？'))api('/api/reboot').then(()=>say('再起動中…')).catch(e=>say(e.message))};
-$('up').onclick=()=>{const f=$('file').files[0];if(!f){say('ファイルを選択してください');return}
- busy=true;$('up').disabled=true;$('prog').hidden=false;$('prog').value=0;say(`送信中 ${fmt(f.size)}`);
- const x=new XMLHttpRequest();x.open('POST','/api/video');x.setRequestHeader('Content-Type','application/octet-stream');x.timeout=600000;
- x.upload.onprogress=e=>{if(e.lengthComputable)$('prog').value=e.loaded/e.total*100};
- x.onload=()=>{busy=false;$('prog').hidden=true;let j={};try{j=JSON.parse(x.responseText)}catch(_){}
-  say(x.status===200?`完了: ${j.frames} フレーム / ${(j.duration_s||0).toFixed(1)} 秒`:`失敗: ${j.error||('HTTP '+x.status)}`);refresh()};
- x.onerror=x.ontimeout=()=>{busy=false;$('prog').hidden=true;say('送信エラー (接続が切れました)');refresh()};
- x.send(f)};
+$('wifi').onclick=()=>{const sd=$('ssid').value.trim();
+ if(!sd&&!confirm('SSID が空です。LAN 接続を無効にしますか？'))return;
+ api('/api/wifi',{ssid:sd,password:$('pass').value}).then(j=>{$('pass').value='';say(sd?`保存しました (${j.ssid})。再起動後に接続します`:'LAN 接続を無効にしました')}).catch(e=>say(e.message))};
+
 if(/[?&]cna=1/.test(location.search)){$('cna').hidden=false;$('cnaUrl').textContent=location.origin+'/'}
 refresh();setInterval(refresh,2000);
 </script></body></html>)HTML";
@@ -107,6 +130,7 @@ SoloWebServer::SoloWebServer()
       _config(nullptr),
       _player(nullptr),
       _led(nullptr),
+      _net(nullptr),
       _rxBuf(nullptr),
       _brightnessPct(50),
       _rebootAtMs(0),
@@ -123,14 +147,17 @@ SoloWebServer::~SoloWebServer() {
     }
 }
 
-bool SoloWebServer::begin(ConfigManager& config, SoloPlayer& player, LEDManager& led, uint16_t port) {
+bool SoloWebServer::begin(ConfigManager& config, SoloPlayer& player, LEDManager& led,
+                          NetworkManager& net, uint16_t port) {
     if (_server) {
         return true;
     }
     _config = &config;
     _player = &player;
     _led = &led;
-    _brightnessPct = config.getParamBrightness();
+    _net = &net;
+    // 利用者が UI で変えた値 (NVS) を優先し、無ければ config.json の既定値を使う
+    _brightnessPct = Settings::brightness(config.getParamBrightness());
 
     if (!_rxBuf) {
         _rxBuf = (uint8_t*)malloc(kRxBufSize);
@@ -145,7 +172,7 @@ bool SoloWebServer::begin(ConfigManager& config, SoloPlayer& player, LEDManager&
     cfg.core_id = 0;               // WiFi/lwIP・再生タスクと同じ Core0。描画(Core1)を汚さない
     cfg.task_priority = 2;         // 既定(5)は高すぎるので描画タスクと同等まで下げる
     cfg.stack_size = 8192;
-    cfg.max_uri_handlers = 12;
+    cfg.max_uri_handlers = 16;
     cfg.max_open_sockets = 4;
     cfg.lru_purge_enable = true;
     cfg.recv_wait_timeout = 30;
@@ -159,9 +186,12 @@ bool SoloWebServer::begin(ConfigManager& config, SoloPlayer& player, LEDManager&
 
     const httpd_uri_t routes[] = {
         {"/",                 HTTP_GET,  onRoot,       this, false, false, nullptr},
+        {"/convert",          HTTP_GET,  onConvert,    this, false, false, nullptr},
         {"/api/status",       HTTP_GET,  onStatus,     this, false, false, nullptr},
         {"/api/play",         HTTP_POST, onPlay,       this, false, false, nullptr},
         {"/api/stop",         HTTP_POST, onStop,       this, false, false, nullptr},
+        {"/api/pause",        HTTP_POST, onPause,      this, false, false, nullptr},
+        {"/api/wifi",         HTTP_POST, onWifi,       this, false, false, nullptr},
         {"/api/brightness",   HTTP_POST, onBrightness, this, false, false, nullptr},
         {"/api/video",        HTTP_POST, onUpload,     this, false, false, nullptr},
         {"/api/video/delete", HTTP_POST, onDelete,     this, false, false, nullptr},
@@ -199,6 +229,7 @@ void SoloWebServer::end() {
 }
 
 void SoloWebServer::loop() {
+    Settings::tick();  // 保留中の設定変更を書き出す
     if (_dnsStarted) {
         _dns.processNextRequest();
     }
@@ -246,6 +277,7 @@ bool SoloWebServer::readBody(httpd_req_t* req, char* out, size_t cap, size_t& le
 }
 
 void SoloWebServer::applyBrightness(uint8_t percent) {
+    Settings::setBrightness(percent);  // 遅延保存 (スライダー操作をまとめて 1 回書く)
     if (percent > 100) percent = 100;
     _brightnessPct = percent;
     if (_led) {
@@ -254,6 +286,7 @@ void SoloWebServer::applyBrightness(uint8_t percent) {
 }
 
 void SoloWebServer::scheduleReboot(uint32_t delayMs) {
+    Settings::flush();  // 再起動で失わないよう確定させる
     _rebootAtMs = millis() + delayMs;
     if (_rebootAtMs == 0) _rebootAtMs = 1;
 }
@@ -280,9 +313,16 @@ size_t SoloWebServer::maxUploadBytes(size_t& freeOut, size_t& existingOut) const
 // ---------------------------------------------------------------------------
 
 esp_err_t SoloWebServer::onRoot(httpd_req_t* req) {
+    static_cast<SoloWebServer*>(req->user_ctx)->_uiServed = true;
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, kIndexHtml, sizeof(kIndexHtml) - 1);
+}
+
+esp_err_t SoloWebServer::onConvert(httpd_req_t* req) {
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, kConvertHtml, strlen(kConvertHtml));
 }
 
 esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
@@ -304,6 +344,7 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
         "\"last_frame_bytes\":%u,\"read_us\":%u,\"tick_us\":%u},"
         "\"fs\":{\"total\":%u,\"used\":%u,\"free\":%u,\"max_upload\":%u},"
         "\"ap\":{\"ssid\":\"%s\",\"ip\":\"%s\",\"clients\":%u},"
+        "\"sta\":{\"enabled\":%s,\"connected\":%s,\"ssid\":\"%s\",\"ip\":\"%s\"},"
         "\"uploads\":%u,\"upload_failures\":%u,"
         "\"uptime_s\":%lu,\"heap_free\":%u,\"psram_free\":%u}",
         self->_config->getSphereID().c_str(), p.stateName(),
@@ -319,6 +360,10 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
         (unsigned)maxUpload,
         WiFi.softAPSSID().c_str(), WiFi.softAPIP().toString().c_str(),
         (unsigned)WiFi.softAPgetStationNum(),
+        self->_net && self->_net->staEnabled() ? "true" : "false",
+        self->_net && self->_net->staConnected() ? "true" : "false",
+        self->_net ? self->_net->staSsid().c_str() : "",
+        self->_net && self->_net->staConnected() ? WiFi.localIP().toString().c_str() : "",
         (unsigned)self->_uploads, (unsigned)self->_uploadFailures,
         (unsigned long)(millis() / 1000), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
     if (n < 0 || (size_t)n >= sizeof(self->_jsonBuf)) {
@@ -347,6 +392,41 @@ esp_err_t SoloWebServer::onStop(httpd_req_t* req) {
     }
     self->_player->stop();
     snprintf(self->_jsonBuf, sizeof(self->_jsonBuf), "{\"ok\":true,\"state\":\"%s\"}", self->_player->stateName());
+    return self->sendJson(req, "200 OK", self->_jsonBuf);
+}
+
+esp_err_t SoloWebServer::onPause(httpd_req_t* req) {
+    auto* self = static_cast<SoloWebServer*>(req->user_ctx);
+    if (self->_player->state() == SoloPlayer::State::Uploading) {
+        return self->sendError(req, "409 Conflict", "upload in progress");
+    }
+    self->_player->pause();
+    snprintf(self->_jsonBuf, sizeof(self->_jsonBuf), "{\"ok\":true,\"state\":\"%s\"}", self->_player->stateName());
+    return self->sendJson(req, "200 OK", self->_jsonBuf);
+}
+
+esp_err_t SoloWebServer::onWifi(httpd_req_t* req) {
+    auto* self = static_cast<SoloWebServer*>(req->user_ctx);
+    char body[192];
+    size_t len = 0;
+    if (!self->readBody(req, body, sizeof(body), len)) {
+        return self->sendError(req, "400 Bad Request", "invalid body");
+    }
+    StaticJsonDocument<256> doc;
+    if (deserializeJson(doc, body, len) != DeserializationError::Ok) {
+        return self->sendError(req, "400 Bad Request", "expected json {ssid, password}");
+    }
+    const char* ssid = doc["ssid"] | "";
+    const char* pass = doc["password"] | "";
+    if (strlen(ssid) > 32 || strlen(pass) > 63) {
+        return self->sendError(req, "400 Bad Request", "ssid/password too long");
+    }
+    // 空 SSID = 無効化。反映は次回起動から (稼働中に mode を変えると AP が落ちるため)
+    if (!NetworkManager::saveStaCredentials(String(ssid), String(pass))) {
+        return self->sendError(req, "500 Internal Server Error", "failed to save credentials");
+    }
+    snprintf(self->_jsonBuf, sizeof(self->_jsonBuf),
+             "{\"ok\":true,\"ssid\":\"%s\",\"note\":\"reboot to apply\"}", ssid);
     return self->sendJson(req, "200 OK", self->_jsonBuf);
 }
 
@@ -512,9 +592,42 @@ esp_err_t SoloWebServer::onNotFound(httpd_req_t* req, httpd_err_code_t) {
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_send(req, "{\"ok\":false,\"error\":\"not found\"}", HTTPD_RESP_USE_STRLEN);
     }
-    // キャプティブポータル検出 (iOS: /hotspot-detect.html, Android: /generate_204,
-    // Windows: /connecttest.txt など) を含む未知パスは UI へリダイレクト。
-    // 期待される "Success" 応答が返らないため OS が「ネットワークにログイン」画面を開く。
+    // キャプティブポータル検出プローブ (iOS/macOS: /hotspot-detect.html,
+    // Android: /generate_204, Windows: /connecttest.txt など)。
+    //   captive_portal = false (既定): 期待どおりの応答を返し「ログイン」画面を開かせない。
+    //     iOS の CNA はファイル選択ダイアログが出ず動画をアップロードできないため、
+    //     最初から Safari で開いてもらう (LCD が UI の URL QR を出す)。
+    //   captive_portal = true: 応答せずリダイレクトし、接続と同時に UI を自動表示する。
+    auto* self = static_cast<SoloWebServer*>(req->user_ctx);
+    const bool captive = (self && self->_config) ? self->_config->getSoloCaptivePortal() : false;
+    if (!captive) {
+        const char* uri = req->uri;
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+        if (strcmp(uri, "/generate_204") == 0 || strcmp(uri, "/gen_204") == 0) {
+            httpd_resp_set_status(req, "204 No Content");
+            return httpd_resp_send(req, nullptr, 0);
+        }
+        if (strcmp(uri, "/hotspot-detect.html") == 0 ||
+            strcmp(uri, "/library/test/success.html") == 0) {
+            httpd_resp_set_type(req, "text/html");
+            return httpd_resp_send(req,
+                "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>",
+                HTTPD_RESP_USE_STRLEN);
+        }
+        if (strcmp(uri, "/success.txt") == 0) {
+            httpd_resp_set_type(req, "text/plain");
+            return httpd_resp_send(req, "success", HTTPD_RESP_USE_STRLEN);
+        }
+        if (strcmp(uri, "/connecttest.txt") == 0) {
+            httpd_resp_set_type(req, "text/plain");
+            return httpd_resp_send(req, "Microsoft Connect Test", HTTPD_RESP_USE_STRLEN);
+        }
+        if (strcmp(uri, "/ncsi.txt") == 0) {
+            httpd_resp_set_type(req, "text/plain");
+            return httpd_resp_send(req, "Microsoft NCSI", HTTPD_RESP_USE_STRLEN);
+        }
+    }
+    // プローブ以外の未知パス (ユーザーが何か入力した等) は UI へ誘導する
     char location[64];
     snprintf(location, sizeof(location), "http://%s/?cna=1", WiFi.softAPIP().toString().c_str());
     httpd_resp_set_status(req, "302 Found");

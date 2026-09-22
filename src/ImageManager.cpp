@@ -131,14 +131,43 @@ bool ImageManager::submitJpegFrame(const uint8_t* jpeg, size_t size) {
     return true;
 }
 
+// デコード失敗の診断ログ: JRESULT と、渡したバッファの素性 (先頭/末尾のマーカー、アドレス) を出す。
+// 毎フレーム出すとシリアルが溢れて文字が落ちるため 1 秒に 1 回へ間引く。
+static void logDecodeFailure(const char* where, int res, const uint8_t* p, size_t n) {
+    static unsigned long lastMs = 0;
+    static uint32_t suppressed = 0;
+    const unsigned long now = millis();
+    if (now - lastMs < 1000) { suppressed++; return; }
+    lastMs = now;
+    const char* name = "?";
+    switch (res) {
+        case 1: name = "JDR_INTR"; break;
+        case 2: name = "JDR_INP";  break;
+        case 3: name = "JDR_MEM1 (workspace不足)"; break;
+        case 4: name = "JDR_MEM2 (出力バッファ不足)"; break;
+        case 5: name = "JDR_PAR";  break;
+        case 6: name = "JDR_FMT1 (データ破損)"; break;
+        case 7: name = "JDR_FMT2 (非対応形式)"; break;
+        case 8: name = "JDR_FMT3 (非対応JPEG標準)"; break;
+        default: break;
+    }
+    Serial.printf("[ImageManager] %s failed: res=%d %s size=%u ptr=%p "
+                  "head=%02X%02X%02X%02X tail=%02X%02X (suppressed=%u)\n",
+                  where, res, name, (unsigned)n, p,
+                  n > 3 ? p[0] : 0, n > 3 ? p[1] : 0, n > 3 ? p[2] : 0, n > 3 ? p[3] : 0,
+                  n > 1 ? p[n-2] : 0, n > 1 ? p[n-1] : 0, (unsigned)suppressed);
+    suppressed = 0;
+}
+
 bool ImageManager::decodeJPEG(const uint8_t* jpeg_data, size_t jpeg_size) {
     // デコードターゲットバッファを設定
     _tjpgTargetBuffer = _decodeBuffer;
 
     // JPEGヘッダから解像度を取得して検証
     uint16_t w = 0, h = 0;
-    if (TJpgDec.getJpgSize(&w, &h, jpeg_data, jpeg_size) != JDR_OK) {
-        Serial.println("[ImageManager] Failed to get JPEG size");
+    const JRESULT szRes = TJpgDec.getJpgSize(&w, &h, jpeg_data, jpeg_size);
+    if (szRes != JDR_OK) {
+        logDecodeFailure("getJpgSize", (int)szRes, jpeg_data, jpeg_size);
         return false;
     }
     if (w != _width || h != _height) {
@@ -149,13 +178,22 @@ bool ImageManager::decodeJPEG(const uint8_t* jpeg_data, size_t jpeg_size) {
 
     // デコード実行 (所要時間を計測)
     unsigned long decodeStart = micros();
-    if (TJpgDec.drawJpg(0, 0, jpeg_data, jpeg_size) != JDR_OK) {
-        Serial.println("[ImageManager] JPEG decode failed");
+    const JRESULT drawRes = TJpgDec.drawJpg(0, 0, jpeg_data, jpeg_size);
+    if (drawRes != JDR_OK) {
+        logDecodeFailure("drawJpg", (int)drawRes, jpeg_data, jpeg_size);
         return false;
     }
     _lastDecodeUs = (uint32_t)(micros() - decodeStart);
 
     return true;
+}
+
+void ImageManager::publishBlack() {
+    if (!_initialized || !_decodeBuffer) {
+        return;
+    }
+    memset(_decodeBuffer, 0, _bufferSize);
+    publishFrame();
 }
 
 // decode側: 完成フレームを ready に公開し、次の書込先(_decodeBuffer)を更新する。

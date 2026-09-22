@@ -11,6 +11,8 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 
+#include "MjpegAssembler.h"
+
 namespace sastle {
 
 /// ファイル全体を走査して得た MJPEG の素性
@@ -29,8 +31,9 @@ struct MjpegInfo {
  * @brief raw MJPEG ファイルの順次読み出し (EOFで先頭へループ)
  *
  * フレームバッファは呼び出し側が確保して渡す (PSRAM を想定)。読み出したフレームは
- * そのバッファ先頭に置かれ、次フレーム分まで先読みされたバイトはバッファ内に保持して
- * 次回呼び出しで再利用する。
+ * そのバッファ先頭に置かれ、次に next() を呼ぶまで保たれる。先読みしたバイトはフレームの
+ * 後ろに保持し、次回呼び出しの冒頭で先頭へ寄せる (バッファ管理は MjpegAssembler.h、
+ * native env で単体テスト済み)。
  */
 class MjpegReader {
 public:
@@ -43,7 +46,7 @@ public:
         TooLarge,  ///< 1フレームがバッファ上限を超える
     };
 
-    MjpegReader() : _buf(nullptr), _cap(0), _fill(0), _fileBytes(0), _loops(0), _open(false) {}
+    MjpegReader() : _fileBytes(0), _open(false) { _src.file = &_file; }
     ~MjpegReader() { close(); }
 
     /**
@@ -65,7 +68,7 @@ public:
     Status next(size_t& outSize, bool& wrapped);
 
     size_t fileBytes() const { return _fileBytes; }
-    uint32_t loops() const { return _loops; }
+    uint32_t loops() const { return _asm.loops(); }
 
     /**
      * @brief ファイル全体を走査して受理可否を判定する (アップロード検証用)
@@ -87,15 +90,17 @@ public:
                          MjpegInfo& out, const char** errorOut);
 
 private:
-    /// ファイルから buf の空き領域へ追記読み。戻り値=読み込めたバイト数 (0=EOF)
-    size_t fillMore();
+    /// LittleFS の File を MjpegAssembler の読み出し源として包む
+    struct FileSource {
+        fs::File* file;
+        size_t read(uint8_t* dst, size_t maxBytes) { return file ? file->read(dst, maxBytes) : 0; }
+        void rewind() { if (file) file->seek(0); }
+    };
 
     fs::File _file;
-    uint8_t* _buf;
-    size_t _cap;
-    size_t _fill;        ///< _buf 内の有効バイト数
+    FileSource _src;
+    mjpeg::Assembler<FileSource> _asm;
     size_t _fileBytes;
-    uint32_t _loops;     ///< ループ回数
     bool _open;
 };
 
