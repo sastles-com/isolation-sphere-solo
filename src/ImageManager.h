@@ -66,17 +66,29 @@ public:
      * @param size JPEGバイト数
      * @return true デコード成功, false 解像度不一致/デコード失敗
      * @warning TJpg_Decoder はグローバル単一インスタンスなので、複数タスクから
-     *          同時に呼んではいけない (solo では SoloPlayer タスクのみが呼ぶ)。
+     *          同時に呼んではいけない (FramePump タスクのみが呼ぶ。ローカル再生も
+     *          UDP 配信も同じタスクが順番に処理する)。
      */
     bool submitJpegFrame(const uint8_t* jpeg, size_t size);
 
     /**
      * @brief 全画素 0 のフレームを公開する (停止・動画削除・エラー時に LED を消灯させる)
      * @note 描画タスクは publish 済みフレームを再マッピングし続けるため、停止しても
-     *       最後の映像が残る。呼び出し側は SoloPlayer のミューテックスを保持していること
-     *       (デコードと同じバッファに書くため)。
+     *       最後の映像が残る。デコードと同じバッファに書くため、呼べるのはデコードを行う
+     *       タスク (FramePump) のみ。他のタスクは requestBlack() で要求する。
      */
     void publishBlack();
+
+    /// 消灯を要求する (任意のタスクから可)。FramePump が serviceBlankRequest() で実行する
+    void requestBlack() { _blankRequested = true; }
+    /// 保留中の消灯要求があれば実行する (FramePump タスクのみ)
+    void serviceBlankRequest() {
+        if (_blankRequested) {
+            _blankRequested = false;
+            publishBlack();
+        }
+    }
+    bool blankPending() const { return _blankRequested; }
 
     /**
      * @brief 指定座標のピクセル色を取得 (RGB)
@@ -122,6 +134,7 @@ private:
     float _currentFPS;           ///< 現在のFPS
     size_t _lastJpegSize;        ///< 最終JPEGサイズ
     uint32_t _lastDecodeUs = 0;  ///< 最後のJPEGデコード所要時間 (μs)
+    volatile bool _blankRequested = false;  ///< requestBlack() の保留フラグ
 
     /**
      * @brief PSRAMにバッファを確保

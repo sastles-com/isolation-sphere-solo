@@ -23,7 +23,6 @@ SoloPlayer::SoloPlayer()
       _frameBuf(nullptr),
       _frameCap(0),
       _mutex(nullptr),
-      _task(nullptr),
       _state(State::NoVideo),
       _lastError(nullptr),
       _videoBytes(0),
@@ -40,10 +39,6 @@ SoloPlayer::SoloPlayer()
       _fpsTimestamp(0) {}
 
 SoloPlayer::~SoloPlayer() {
-    if (_task) {
-        vTaskDelete(_task);
-        _task = nullptr;
-    }
     _reader.close();
     if (_frameBuf) {
         free(_frameBuf);
@@ -86,20 +81,6 @@ bool SoloPlayer::begin(ConfigManager& config, ImageManager& image) {
     return true;
 }
 
-bool SoloPlayer::startTask(uint8_t core, uint8_t priority, uint32_t stackSize) {
-    if (_task) {
-        return true;
-    }
-    BaseType_t r = xTaskCreatePinnedToCore(taskFunc, "solo_play", stackSize, this, priority, &_task, core);
-    if (r != pdPASS) {
-        Serial.println("[SoloPlayer] Failed to create playback task");
-        _task = nullptr;
-        return false;
-    }
-    Serial.printf("[SoloPlayer] Playback task pinned to core %u (prio %u)\n", core, priority);
-    return true;
-}
-
 // ---------------------------------------------------------------------------
 // 状態操作 (HTTP / シリアルコンソール側から呼ばれる)
 // ---------------------------------------------------------------------------
@@ -118,7 +99,7 @@ void SoloPlayer::stop() {
     if (_state == State::Playing || _state == State::Paused) {
         _state = State::Stopped;
         Serial.println("[SoloPlayer] stop");
-        if (_image) _image->publishBlack();  // 停止 = 消灯 (一時停止との違い)
+        if (_image) _image->requestBlack();  // 停止 = 消灯 (一時停止との違い)。実行は FramePump
     }
     xSemaphoreGive(_mutex);
 }
@@ -223,22 +204,22 @@ void SoloPlayer::closeVideoLocked() {
     if (_state == State::Playing || _state == State::Paused || _state == State::Stopped) {
         _state = State::NoVideo;
     }
-    if (_image) _image->publishBlack();  // 動画が無い間は消灯
+    if (_image) _image->requestBlack();  // 動画が無い間は消灯
 }
 
 void SoloPlayer::setErrorLocked(const char* msg) {
     _reader.close();
     _state = State::Error;
     _lastError = msg;
-    if (_image) _image->publishBlack();  // エラー時も消灯
+    if (_image) _image->requestBlack();  // エラー時も消灯
 }
 
 // ---------------------------------------------------------------------------
-// 再生タスク
+// 1 フレーム供給 (FramePump タスクから 100ms 締切ごとに呼ばれる)
 // ---------------------------------------------------------------------------
 
 void SoloPlayer::tick() {
-    if (_state != State::Playing) {
+    if (_state != State::Playing || !_mutex || !_image) {
         return;
     }
     // HTTP 側が操作中なら今回のフレームは見送る (次の締切で再試行)
@@ -290,34 +271,6 @@ void SoloPlayer::tick() {
     }
 
     xSemaphoreGive(_mutex);
-}
-
-void SoloPlayer::taskFunc(void* param) {
-    SoloPlayer* self = static_cast<SoloPlayer*>(param);
-    Serial.printf("[SoloPlayer] task started on core %d\n", xPortGetCoreID());
-
-    // 単調増加クロック (esp_timer) で締切を管理する。処理時間ぶん待ち時間を削るので、
-    // 「デコード後に100ms待つ」方式のような累積ドリフトが起きない。
-    int64_t next = esp_timer_get_time() + kPeriodUs;
-    for (;;) {
-        self->tick();
-
-        const int64_t now = esp_timer_get_time();
-        if (now < next) {
-            const int64_t waitUs = next - now;
-            TickType_t ticks = pdMS_TO_TICKS(waitUs / 1000);
-            vTaskDelay(ticks > 0 ? ticks : 1);
-        } else {
-            // 締切超過: 遅れたぶんの締切は捨てて次の締切へ揃える (遅延を溜め込まない)。
-            const int64_t missed = (now - next) / kPeriodUs;
-            if (missed > 0) {
-                self->_deadlineMisses += (uint32_t)missed;
-                next += missed * kPeriodUs;
-            }
-            vTaskDelay(1);  // busy loop 防止
-        }
-        next += kPeriodUs;
-    }
 }
 
 // ---------------------------------------------------------------------------

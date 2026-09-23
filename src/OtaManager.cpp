@@ -2,34 +2,38 @@
 #include "Log.h"
 #include "LEDManager.h"
 #include "SoloPlayer.h"
+#include "FramePump.h"
 
 #include <ArduinoOTA.h>
 
 namespace sastle {
 
 namespace {
-// OTA のホスト名とパスワード。
-// espota は IP 指定 (upload_port=192.168.49.101) で書き込むため、
-// ホスト名は mDNS 上の識別用。パスワードは upload_flags=--auth と一致させる。
-constexpr const char* kOtaHostname = "isolation-sphere";
+// OTA のパスワード。upload_flags=--auth と一致させる。
 constexpr const char* kOtaPassword = "isolation-sphere-ota";
+constexpr const char* kOtaDefaultHostname = "isolation-sphere";
 }
 
-bool OtaManager::begin(LEDManager* led, SoloPlayer* player) {
+bool OtaManager::begin(LEDManager* led, FramePump* pump, SoloPlayer* player, const char* hostname) {
     _led = led;
+    _pump = pump;
     _player = player;
 
-    ArduinoOTA.setHostname(kOtaHostname);
+    const char* host = (hostname && hostname[0]) ? hostname : kOtaDefaultHostname;
+    ArduinoOTA.setHostname(host);
     ArduinoOTA.setPassword(kOtaPassword);
 
     ArduinoOTA.onStart([this]() {
         const bool isFs = (ArduinoOTA.getCommand() == U_SPIFFS);
         Log.printf("\n[OTA] Start: %s update\n", isFs ? "filesystem" : "firmware");
-        // 再生を先に止める。再生中は Core0 が 100ms 中 60ms をデコードに使い、
-        // LittleFS も読み続けるため、OTA の受信とフラッシュ書き込みが間に合わない
-        // (実機で転送 0% のまま失敗した)。
+        // 供給を先に止める。再生中は Core0 が 100ms 中 60ms をデコードに使い、LittleFS も
+        // 読み続けるため、OTA の受信とフラッシュ書き込みが間に合わない (実機で転送 0% のまま
+        // 失敗した)。UDP 配信中も同様なので受信器も閉じる (server は OTA 中も送り続ける)。
         if (_player) {
             _player->stop();
+        }
+        if (_pump) {
+            _pump->stopForOta();
         }
         // 描画タスクを止めて Core1 とフラッシュ操作ロックを解放する。
         // stopRenderTask() は協調停止 (show() の途中で殺さない) であること。
@@ -67,7 +71,7 @@ bool OtaManager::begin(LEDManager* led, SoloPlayer* player) {
 
     ArduinoOTA.begin();
     _started = true;
-    Log.printf("[OTA] Ready (hostname=%s, port=3232)\n", kOtaHostname);
+    Log.printf("[OTA] Ready (hostname=%s, port=3232)\n", host);
     return true;
 }
 

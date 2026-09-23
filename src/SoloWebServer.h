@@ -31,6 +31,7 @@
 #include "IMUManager.h"
 #include "NetworkManager.h"
 #include "SoloPlayer.h"
+#include "UdpReceiver.h"
 
 namespace sastle {
 
@@ -48,7 +49,7 @@ public:
      * @param port    リッスンポート
      */
     bool begin(DeviceController& ctl, ConfigManager& config, SoloPlayer& player, LEDManager& led,
-               NetworkManager& net, IMUManager& imu, uint16_t port);
+               NetworkManager& net, IMUManager& imu, uint16_t port, UdpReceiver* udp = nullptr);
     void end();
     bool isRunning() const { return _server != nullptr; }
 
@@ -73,6 +74,7 @@ private:
     static esp_err_t onImuGet(httpd_req_t* req);
     static esp_err_t onImuPost(httpd_req_t* req);
     static esp_err_t onServer(httpd_req_t* req);
+    static esp_err_t onSource(httpd_req_t* req);
 
     static esp_err_t onBrightness(httpd_req_t* req);
     static esp_err_t onUpload(httpd_req_t* req);
@@ -98,6 +100,7 @@ private:
     LEDManager* _led;
     NetworkManager* _net;
     IMUManager* _imu;
+    UdpReceiver* _udp = nullptr;   ///< 統計表示用 (nullptr 可)
 
     uint8_t* _rxBuf;              ///< 受信作業バッファ (ヒープ)
     char _jsonBuf[1536];          ///< 応答組み立て (ハンドラは httpd タスクで直列実行)

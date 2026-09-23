@@ -5,9 +5,14 @@
  * 起動すると SoftAP を立て、LittleFS 上の raw MJPEG (320x160, 10fps) を自動ループ再生する。
  * 操作は本体 LCD の QR から iPhone を接続し、Web UI (http://192.168.4.1/) で行う。
  *
+ * server モード (config.json wifi{} 有効時) では同じファームが P2P 網にも STA で入り、
+ * UDP で届く JPEG を優先表示し、MQTT で操作を受ける (配信が途切れるとローカル再生に戻る)。
+ *
  * タスク構成:
- *   Core0: WiFi/lwIP, solo_play (再生: ファイル読み+JPEGデコード), httpd (Web UI/アップロード)
- *   Core1: LED_Render (IMU姿勢で毎パス再マッピング + RMT出力), loopTask (本ファイルの loop)
+ *   Core0: WiFi/lwIP, async_udp (受信→キュー), frame_pump (UDP 再構成 or ローカル MJPEG 読み
+ *          → JPEG デコード。デコードは必ずこのタスク), httpd (Web UI/アップロード)
+ *   Core1: LED_Render (IMU姿勢で毎パス再マッピング + RMT出力), imu (100Hz),
+ *          loopTask (本ファイルの loop: OTA/ネットワーク/MQTT/ログ/LCD)
  */
 
 #include <Arduino.h>
@@ -29,6 +34,8 @@
 #include "SoloWebServer.h"
 #include "DeviceController.h"
 #include "SerialConsole.h"
+#include "FramePump.h"
+#include "UdpReceiver.h"
 
 using namespace sastle;
 
@@ -48,6 +55,8 @@ SoloPlayer soloPlayer;
 SoloWebServer soloWeb;
 DeviceController controller;   // HTTP / MQTT / コンソールが共通で呼ぶ操作の窓口
 SerialConsole console;
+UdpReceiver udpRx;             // UDP 映像チャンク受信 (server モード時のみ listen)
+FramePump pump;                // フレーム供給の単一タスク (UDP 再構成 / ローカル再生 → デコード)
 
 // LCD に出す Wi-Fi 接続 QR ("WIFI:T:WPA;S:..;P:..;;") と表示用文字列
 static String g_wifiQrText;
@@ -190,7 +199,7 @@ void setup() {
     // OTA (espota) 初期化: AP が立った直後に受け口を開く。これ以降の初期化
     // (IMU / LED / 再生 / Web) で失敗・停止しても、無線での書き戻しは生き残る。
     // stopRenderTask() は _taskRunning ガードがあるため未初期化でも安全。
-    ota.begin(&ledManager, &soloPlayer);
+    ota.begin(&ledManager, &pump, &soloPlayer, config.getSphereID().c_str());
 
     // IMU初期化前に I2C バスを走査 (BNO055 の有無を切り分けるため)
     scanI2cBus(kImuI2cSda, kImuI2cScl);
@@ -218,6 +227,26 @@ void setup() {
         sastle::Log.println("ImageManager initialization failed (continuing without image)");
     } else {
         imageManager.printStats();
+
+        // フレーム供給タスク (Core0)。UDP 受信より先に立てる: server は球体の MQTT status を
+        // 見た瞬間に配信を始めるので、受け側 (キュー + デコード) が先に居ないと起動直後の
+        // フラッドで詰まる (派生元の知見)。server 無効時は単にローカル再生の締切を回す。
+        FramePump::Deps pd;
+        pd.image = &imageManager;
+        pd.player = &soloPlayer;
+        pd.udp = &udpRx;
+        if (pump.begin(pd, config.getSourceConfig())) {
+            pump.startTask(0, 1, 8192);
+        } else {
+            sastle::Log.println("FramePump initialization failed (no frame source)");
+        }
+        if (config.isServerConfigured()) {
+            // listen は ANY にバインドするので STA 接続前でも開ける
+            const WiFiConfig wcfg = config.getWiFiConfig();
+            if (!udpRx.begin((uint16_t)wcfg.udp_port, config.getSourceConfig().udp_queue_len)) {
+                sastle::Log.println("UDP receiver failed to start (network video disabled)");
+            }
+        }
     }
 
     // LCDManager初期化 (デバッグモード)
@@ -261,22 +290,21 @@ void setup() {
         deps.led = &ledManager;
         deps.imu = imuSensor.isInitialized() ? &imuSensor : nullptr;
         deps.net = &network;
+        deps.pump = &pump;
         controller.begin(deps);
         console.begin(controller, g_apSsid);
     }
 
-    // 再生タスク (Core 0) と Web UI を開始。
-    // 再生は LittleFS 読み出し + JPEG デコードを 100ms 締切で回し、描画 (Core1) とは
-    // トリプルバッファ経由で独立に動く。
+    // ローカル再生と Web UI を開始。
+    // 再生は FramePump が LittleFS 読み出し + JPEG デコードを 100ms 締切で回し、描画 (Core1)
+    // とはトリプルバッファ経由で独立に動く。
     if (imageManager.isInitialized()) {
-        if (soloPlayer.begin(config, imageManager)) {
-            soloPlayer.startTask(0, 1, 6144);
-        } else {
+        if (!soloPlayer.begin(config, imageManager)) {
             sastle::Log.println("SoloPlayer initialization failed");
         }
         if (network.isSoftAP()) {
             if (!soloWeb.begin(controller, config, soloPlayer, ledManager, network, imuSensor,
-                               config.getSoloHttpPort())) {
+                               config.getSoloHttpPort(), &udpRx)) {
                 sastle::Log.println("Web server failed to start");
             }
         }
@@ -322,12 +350,16 @@ static void logPerfIfDue(unsigned long now) {
                        led.imu_ortho_err_max, led.imu_norm_err_max, led.imu_step_deg_max);
     ledManager.resetImuDiag();
 
+    const FramePump::Stats ps = pump.stats();
     sastle::Log.printf(
-        "[PERF] render_fps=%.1f map=%luus out=%luus stale=%.0f%% | img_fps=%.1f decode=%luus jpeg=%uB drop=%lu | heap=%u\n",
+        "[PERF] render_fps=%.1f map=%luus out=%luus stale=%.0f%% | img_fps=%.1f decode=%luus jpeg=%uB drop=%lu "
+        "| src=%s net_fps=%.1f udp=%lu reasm_drop=%lu pump_stack=%lu | heap=%u\n",
         led.fps, (unsigned long)led.mapping_time_us, (unsigned long)led.output_time_us,
         stalePct,
         img.fps, (unsigned long)img.decode_time_us, (unsigned)img.last_jpeg_size,
-        (unsigned long)imageManager.getDropped(), (unsigned)ESP.getFreeHeap());
+        (unsigned long)imageManager.getDropped(),
+        pump.activeSourceName(), ps.netFps, (unsigned long)udpRx.received(), (unsigned long)ps.reasmDropped,
+        (unsigned long)ps.stackMinWords, (unsigned)ESP.getFreeHeap());
     sastle::Log.printf(
         "[SOLO] state=%s fps=%.1f frames=%lu loops=%lu miss=%lu decode_err=%lu read=%luus tick=%luus clients=%u\n",
         soloPlayer.stateName(), s.fps, (unsigned long)s.frames, (unsigned long)s.loops,

@@ -104,6 +104,12 @@ small{color:#888}#msg{min-height:1.2em;color:#f5b041;font-size:14px;word-break:b
  <div class="row"><button id="wifi">保存</button></div>
 </div>
 <div class="card">
+ <div class="k">映像ソース</div>
+ <div class="row"><span class="k">表示中</span><span id="src" class="v">-</span></div>
+ <div class="row"><button id="s_auto">自動</button><button id="s_local" class="gray">本体のみ</button><button id="s_net" class="gray">配信のみ</button></div>
+ <p><small>自動: 配信 (UDP) が届いていればそれを表示し、途切れると本体の動画に戻ります。本体のみ: 配信を無視します。配信のみ: 本体の動画を再生しません。再起動で「自動」に戻ります。</small></p>
+</div>
+<div class="card">
  <div class="k">サーバ接続 (映像配信サーバがある環境向け)</div>
  <div class="row"><span class="k">状態</span><span id="srv" class="v">-</span></div>
  <p><small>ON にすると起動時に配信サーバの Wi-Fi (P2P 網) にも接続し、UDP で届く映像を優先して表示、MQTT で操作を受けます。映像が届かない間は本体の動画を再生します。OFF は本体だけで動作します。切り替えは保存して再起動します (この AP と本体の動画はどちらでも使えます)。</small></p>
@@ -140,6 +146,9 @@ async function refresh(){if(busy)return;try{const r=await fetch('/api/status',{c
   if(document.activeElement!==$('w')){$('w').value=L.width;$('wval').textContent=L.width}}
  if(s.sta){$('sta').textContent=!s.sta.enabled?'未設定':(s.sta.connected?`${s.sta.ssid} ${s.sta.ip} (${s.sta.origin})`:`${s.sta.ssid} 接続中… (${s.sta.origin})`);
   if(document.activeElement!==$('ssid')&&!$('ssid').value&&s.sta.origin==='nvs'&&s.sta.ssid)$('ssid').placeholder=s.sta.ssid}
+ if(s.source){const R=s.source;const an={local:'本体の動画',network:'配信 (UDP)',none:'なし'}[R.active]||R.active;
+  $('src').textContent=`${an} / ${R.net_fps.toFixed(1)} fps 受信 (${R.net_frames} 枚, 欠落 ${R.reasm_drop})`;
+  const sel=(id,on)=>$(id).className=on?'':'gray';sel('s_auto',R.mode==='auto');sel('s_local',R.mode==='local');sel('s_net',R.mode==='network')}
  if(s.server){const S=s.server;$('srv').textContent=S.enabled&&S.ssid?`ON: ${S.ssid} / ${S.broker}`:'OFF (本体のみ)';
   $('srv_on').className=S.enabled?'':'gray';$('srv_off').className=S.enabled?'gray':''}
  $('play').disabled=!(s.state==='stopped'||s.state==='paused');$('pause').disabled=s.state!=='playing';$('stop').disabled=!(s.state==='playing'||s.state==='paused');
@@ -161,6 +170,8 @@ $('del').onclick=()=>{if(confirm('保存済み動画を削除しますか？'))a
 $('reboot').onclick=()=>{if(confirm('再起動しますか？'))api('/api/reboot').then(()=>say('再起動中…')).catch(e=>say(e.message))};
 const srv=on=>{if(confirm(`サーバ接続を ${on?'ON':'OFF'} にして再起動しますか？`))api('/api/server',{enabled:on}).then(()=>say('保存しました。再起動中…')).catch(e=>say(e.message))};
 $('srv_on').onclick=()=>srv(true);$('srv_off').onclick=()=>srv(false);
+const src=m=>api('/api/source',{mode:m}).then(refresh).catch(e=>say(e.message));
+$('s_auto').onclick=()=>src('auto');$('s_local').onclick=()=>src('local');$('s_net').onclick=()=>src('network');
 $('i_sm').oninput=e=>{$('i_smv').textContent=e.target.value;clearTimeout(smTimer);smTimer=setTimeout(()=>api('/api/imu',{smooth_frames:+e.target.value}).then(refresh).catch(e=>say(e.message)),250)};
 $('i_reset').onclick=()=>{if(confirm('IMU (BNO055) を再初期化しますか？'))api('/api/imu',{reset:true}).then(()=>say('IMU を再初期化しました')).catch(e=>say(e.message))};
 $('wifi').onclick=()=>{const sd=$('ssid').value.trim();
@@ -198,11 +209,13 @@ SoloWebServer::~SoloWebServer() {
 }
 
 bool SoloWebServer::begin(DeviceController& ctl, ConfigManager& config, SoloPlayer& player,
-                          LEDManager& led, NetworkManager& net, IMUManager& imu, uint16_t port) {
+                          LEDManager& led, NetworkManager& net, IMUManager& imu, uint16_t port,
+                          UdpReceiver* udp) {
     if (_server) {
         return true;
     }
     _ctl = &ctl;
+    _udp = udp;
     _config = &config;
     _player = &player;
     _led = &led;
@@ -246,6 +259,7 @@ bool SoloWebServer::begin(DeviceController& ctl, ConfigManager& config, SoloPlay
         {"/api/imu",          HTTP_GET,  onImuGet,     this, false, false, nullptr},
         {"/api/imu",          HTTP_POST, onImuPost,    this, false, false, nullptr},
         {"/api/server",       HTTP_POST, onServer,     this, false, false, nullptr},
+        {"/api/source",       HTTP_POST, onSource,     this, false, false, nullptr},
         {"/api/brightness",   HTTP_POST, onBrightness, this, false, false, nullptr},
         {"/api/video",        HTTP_POST, onUpload,     this, false, false, nullptr},
         {"/api/video/delete", HTTP_POST, onDelete,     this, false, false, nullptr},
@@ -377,6 +391,19 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
         self->_imu->getCalibration(calSys, calGyro, calAccel, calMag);
     }
 
+    // 映像ソース (FramePump) の統計。pump が無ければゼロ
+    FramePump::Stats ps = {};
+    uint32_t udpRx = 0, udpDrop = 0;
+    bool udpListening = false;
+    if (FramePump* pump = self->_ctl->pump()) {
+        ps = pump->stats();
+    }
+    if (self->_udp) {
+        udpRx = self->_udp->received();
+        udpDrop = self->_udp->dropped();
+        udpListening = self->_udp->listening();
+    }
+
     // error は静的ASCII文字列のみ (エスケープ不要)
     int n = snprintf(self->_jsonBuf, sizeof(self->_jsonBuf),
         "{\"device\":\"%s\",\"state\":\"%s\",\"error\":%s%s%s,"
@@ -389,6 +416,8 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
         "\"ap\":{\"ssid\":\"%s\",\"ip\":\"%s\",\"clients\":%u},"
         "\"sta\":{\"enabled\":%s,\"connected\":%s,\"ssid\":\"%s\",\"ip\":\"%s\",\"origin\":\"%s\"},"
         "\"server\":{\"configured\":%s,\"enabled\":%s,\"ssid\":\"%s\",\"broker\":\"%s\"},"
+        "\"source\":{\"mode\":\"%s\",\"active\":\"%s\",\"net_frames\":%u,\"net_fps\":%.1f,\"net_errors\":%u,"
+        "\"udp_rx\":%u,\"udp_drop\":%u,\"reasm_drop\":%u,\"last_net_ms\":%u,\"udp_listening\":%s},"
         "\"led\":{\"mode\":\"%s\",\"pattern\":\"%s\",\"width\":%u,\"axis\":%s},"
         "\"imu\":{\"ok\":%s,\"mode\":%u,\"cal\":\"%u%u%u%u\","
         "\"quat\":[%.3f,%.3f,%.3f,%.3f],\"reads\":%u,\"fails\":%u,\"discards\":%u,\"partial\":%u,\"straddle\":%u,\"seq\":%u,\"smooth\":%u},"
@@ -415,6 +444,10 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
         self->_ctl->serverConfigured() ? "true" : "false",
         self->_config->getWiFiConfig().enabled ? "true" : "false",
         self->_config->getWiFiSSID().c_str(), self->_config->getMQTTBroker().c_str(),
+        self->_ctl->sourceModeName(), self->_ctl->activeSourceName(),
+        (unsigned)ps.netFrames, ps.netFps, (unsigned)ps.netDecodeErrors,
+        (unsigned)udpRx, (unsigned)udpDrop, (unsigned)ps.reasmDropped,
+        (unsigned)(ps.lastNetMs ? (millis() - ps.lastNetMs) : 0), udpListening ? "true" : "false",
         self->_ctl->ledModeName(), self->_ctl->testPatternName(), (unsigned)self->_ctl->testWidth(),
         self->_ctl->axisIndicator() ? "true" : "false",
         imuOk ? "true" : "false", (unsigned)imuMode,
@@ -463,6 +496,26 @@ esp_err_t SoloWebServer::onPause(httpd_req_t* req) {
     auto* self = static_cast<SoloWebServer*>(req->user_ctx);
     return replyPlayResult(self, req, self->_ctl->pause(), self->_jsonBuf, sizeof(self->_jsonBuf),
                            self->_player->stateName(), &SoloWebServer::sendJson, &SoloWebServer::sendError);
+}
+
+// 映像ソースの調停モード: {"mode":"auto|local|network"} (再起動不要、config には保存しない)
+esp_err_t SoloWebServer::onSource(httpd_req_t* req) {
+    auto* self = static_cast<SoloWebServer*>(req->user_ctx);
+    char body[96];
+    size_t len = 0;
+    if (!self->readBody(req, body, sizeof(body), len)) {
+        return self->sendError(req, "400 Bad Request", "invalid body");
+    }
+    StaticJsonDocument<128> doc;
+    if (deserializeJson(doc, body, len) != DeserializationError::Ok || !doc.containsKey("mode")) {
+        return self->sendError(req, "400 Bad Request", "expected {\\\"mode\\\":\\\"auto|local|network\\\"}");
+    }
+    if (!self->_ctl->setSourceMode(doc["mode"] | "")) {
+        return self->sendError(req, "400 Bad Request", "mode must be auto, local or network");
+    }
+    snprintf(self->_jsonBuf, sizeof(self->_jsonBuf), "{\"ok\":true,\"mode\":\"%s\",\"active\":\"%s\"}",
+             self->_ctl->sourceModeName(), self->_ctl->activeSourceName());
+    return self->sendJson(req, "200 OK", self->_jsonBuf);
 }
 
 // server 接続 (config.json wifi.enabled) の切り替え: {"enabled":bool}。保存後に再起動して反映。

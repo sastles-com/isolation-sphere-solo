@@ -238,6 +238,17 @@ bool DeviceController::imuDump(int samples) {
 }
 
 // ---------------------------------------------------------------------------
+// 映像ソース
+// ---------------------------------------------------------------------------
+
+bool DeviceController::setSourceMode(const char* name) {
+    SourceArbiter::Mode m;
+    if (!SourceArbiter::parseMode(name, m)) return false;
+    if (_d.pump) _d.pump->setSourceMode(m);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // ネットワーク / システム
 // ---------------------------------------------------------------------------
 
@@ -289,6 +300,7 @@ bool DeviceController::getStateJson(char* buffer, size_t bufferSize) {
     JsonObject led = doc.createNestedObject("led");
     led["mode"] = ledModeName();
     led["axis"] = axisIndicator();
+    led["source"] = activeSourceName();   // 統合ファームの追加キー (server は未知のキーを無視する)
     if (_d.imu) {
         led["imu_aux"] = _d.imu->auxReads();
         led["imu_i2c_khz"] = _d.imu->i2cClock() / 1000;

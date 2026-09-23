@@ -20,6 +20,7 @@
 #include <ArduinoJson.h>
 
 #include "ConfigManager.h"
+#include "FramePump.h"
 #include "IMUManager.h"
 #include "LEDManager.h"
 #include "NetworkManager.h"
@@ -35,6 +36,7 @@ public:
         LEDManager* led = nullptr;
         IMUManager* imu = nullptr;       ///< 未検出なら nullptr
         NetworkManager* net = nullptr;
+        FramePump* pump = nullptr;
     };
 
     enum class PlayResult : uint8_t { Ok, NoVideo, Uploading, Unavailable };
@@ -91,6 +93,14 @@ public:
     bool imuDump(int samples);                 ///< 1..2000
     void imuResetTiming();
 
+    // --- 映像ソース (FramePump の調停) ---
+    bool setSourceMode(const char* name);      ///< auto | local | network
+    const char* sourceModeName() const { return _d.pump ? _d.pump->sourceModeName() : "auto"; }
+    const char* activeSourceName() const {
+        if (_d.pump) return _d.pump->activeSourceName();
+        return (_d.player && _d.player->state() == SoloPlayer::State::Playing) ? "local" : "none";
+    }
+
     // --- ネットワーク / システム ---
     bool saveStaCredentials(const String& ssid, const String& password);
     /// server 接続 (config.json wifi.enabled) を切り替えて保存する。反映は再起動後
@@ -112,6 +122,7 @@ public:
     IMUManager* imu() const { return _d.imu; }
     NetworkManager* net() const { return _d.net; }
     ConfigManager* config() const { return _d.config; }
+    FramePump* pump() const { return _d.pump; }
 
 private:
     void applyBrightnessToLed(uint8_t pct);

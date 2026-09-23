@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# LAN (STA) 経由の OTA。mDNS (isolation-sphere.local) の解決は PC 側で時々失敗する
+# LAN (STA) 経由の OTA。mDNS (<sphere id>.local、既定 sphere001.local) の解決は PC 側で時々失敗する
 # (getent は通るのに espota の gethostbyname が "Host Not Found" を返す) ため、
 # 先に IP を解決してから --upload-port で直指定する。
 #
@@ -8,7 +8,7 @@
 #   SPHERE_IP=192.168.10.128 tools/ota.sh   # 解決を飛ばして IP 直指定
 set -euo pipefail
 TARGET=${1:-upload}
-HOST=isolation-sphere.local
+HOST=${SPHERE_HOST:-sphere001.local}
 cd "$(dirname "$0")/.."
 IP=${SPHERE_IP:-}
 if [ -z "$IP" ]; then

@@ -1,10 +1,11 @@
 /**
  * @file SoloPlayer.h
- * @brief soloモードのローカル動画再生 (LittleFS raw MJPEG → ImageManager)
+ * @brief ローカル動画再生 (LittleFS raw MJPEG → ImageManager)
  *
- * 既存 server+core 構成では UDP 受信タスク (ImageManager::decodeTaskFunc) が
- * フレームを供給するが、solo では本クラスの再生タスクが LittleFS 上の MJPEG を
- * 固定 10fps で読み出し ImageManager::submitJpegFrame() に流し込む。
+ * フレームの供給は FramePump (単一タスク) が担う。本クラスはファイルの状態管理と、
+ * FramePump から 100ms 締切ごとに呼ばれる tick() で 1 フレーム読んで
+ * ImageManager::submitJpegFrame() に渡すだけ。UDP 配信が生きている間は FramePump が
+ * tick() を呼ばない (ファイル位置は保持され、配信が途切れると続きから再開する)。
  * 描画 (LEDManager レンダタスク / IMU 再マッピング) は供給元を区別しないので共用。
  */
 
@@ -14,7 +15,6 @@
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
-#include <freertos/task.h>
 
 #include "ConfigManager.h"
 #include "ImageManager.h"
@@ -24,7 +24,7 @@ namespace sastle {
 
 /// 再生フレームレート (固定値。ファイル側の fps メタデータは参照しない)
 constexpr uint32_t kSoloFps = 10;
-/// 1フレームの上限バイト数。UDP経路の再構成バッファ (MAX_UDP_IMAGE_SIZE) と同等。
+/// 1フレームの上限バイト数。UDP経路の再構成バッファ (65507B) と同等。
 constexpr size_t kSoloMaxFrameBytes = 65536;
 
 /**
@@ -38,6 +38,9 @@ constexpr size_t kSoloMaxFrameBytes = 65536;
  *   Stopped   : 停止 (LED は消灯。play で続きから再開)
  *   Uploading : アップロード受信中 (再生停止・ファイルクローズ)
  *   Error     : 動画ファイルが壊れている等 (UI から再アップロードで復旧)
+ *
+ * 消灯は ImageManager::requestBlack() で要求し、FramePump が (配信が表示を握っていない
+ * ときに) 実行する。httpd タスクから直接デコードバッファに触らないため。
  */
 class SoloPlayer {
 public:
@@ -64,9 +67,12 @@ public:
     bool begin(ConfigManager& config, ImageManager& image);
 
     /**
-     * @brief 再生タスクを起動 (推奨 Core0 = WiFi/lwIP/ファイルI/O 側)
+     * @brief 1 フレーム読んでデコードに渡す (FramePump が締切ごとに呼ぶ。Playing 以外は何もしない)
+     * @warning TJpg_Decoder は単一インスタンス。FramePump タスク以外から呼ばないこと。
      */
-    bool startTask(uint8_t core = 0, uint8_t priority = 1, uint32_t stackSize = 6144);
+    void tick();
+    /// FramePump が締切超過を検出したときに加算する
+    void addDeadlineMisses(uint32_t n) { _deadlineMisses += n; }
 
     void play();
     void stop();
@@ -108,9 +114,6 @@ public:
     Stats stats() const;
 
 private:
-    static void taskFunc(void* param);
-    void tick();
-
     // 以下 *Locked は _mutex 取得済みで呼ぶ
     bool openVideoLocked();
     void closeVideoLocked();
@@ -128,7 +131,6 @@ private:
     MjpegReader _reader;
 
     SemaphoreHandle_t _mutex;
-    TaskHandle_t _task;
 
     volatile State _state;
     const char* _lastError;
