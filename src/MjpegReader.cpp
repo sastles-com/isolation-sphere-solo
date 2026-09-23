@@ -15,6 +15,9 @@ namespace {
 /// 1回のファイル読み出し単位。大きすぎると1フレームあたりの先読みが増え、
 /// 小さすぎると read 回数が増える。
 constexpr size_t kReadChunk = 2048;
+/// メモリ源の読み出し単位。memcpy (PSRAM→PSRAM) なので大きめでよいが、フレーム確定後に
+/// 先読み分を先頭へ寄せる memmove が増えるので程々に。
+constexpr size_t kMemReadChunk = 4096;
 }  // namespace
 
 bool MjpegReader::open(const char* path, uint8_t* frameBuf, size_t frameCap) {
@@ -37,15 +40,34 @@ bool MjpegReader::open(const char* path, uint8_t* frameBuf, size_t frameCap) {
     _src.file = &_file;
     _asm.begin(&_src, frameBuf, frameCap, kReadChunk, /*loop=*/true);
     _open = true;
+    _fromMemory = false;
+    return true;
+}
+
+bool MjpegReader::openMemory(const uint8_t* data, size_t size, uint8_t* frameBuf, size_t frameCap) {
+    close();
+    if (!data || size == 0 || !frameBuf || frameCap < 64) {
+        return false;
+    }
+    _memSrc.data = data;
+    _memSrc.size = size;
+    _memSrc.pos = 0;
+    _fileBytes = size;
+    _asmMem.begin(&_memSrc, frameBuf, frameCap, kMemReadChunk, /*loop=*/true);
+    _open = true;
+    _fromMemory = true;
     return true;
 }
 
 void MjpegReader::close() {
-    if (_open) {
+    if (_open && !_fromMemory) {
         _file.close();
-        _open = false;
     }
+    _open = false;
+    _fromMemory = false;
     _asm.reset();
+    _asmMem.reset();
+    _memSrc = mjpeg::MemorySource();
     _fileBytes = 0;
 }
 
@@ -55,7 +77,8 @@ MjpegReader::Status MjpegReader::next(size_t& outSize, bool& wrapped) {
     if (!_open) {
         return Status::NotOpen;
     }
-    switch (_asm.next(outSize, wrapped)) {
+    const mjpeg::Status st = _fromMemory ? _asmMem.next(outSize, wrapped) : _asm.next(outSize, wrapped);
+    switch (st) {
         case mjpeg::Status::Ok:       return Status::Ok;
         case mjpeg::Status::Empty:    return Status::Empty;
         case mjpeg::Status::TooLarge: return Status::TooLarge;
@@ -66,29 +89,22 @@ MjpegReader::Status MjpegReader::next(size_t& outSize, bool& wrapped) {
     }
 }
 
-bool MjpegReader::validate(const char* path, uint16_t expectWidth, uint16_t expectHeight,
-                           size_t maxFrameBytes, uint8_t* scratch, size_t scratchCap,
-                           MjpegInfo& out, const char** errorOut) {
+template <typename Source>
+bool MjpegReader::validateWith(Source& src, size_t totalBytes, size_t readChunk, uint16_t expectWidth,
+                               uint16_t expectHeight, size_t maxFrameBytes, uint8_t* scratch,
+                               size_t scratchCap, MjpegInfo& out, const char** errorOut) {
     out = MjpegInfo();
     const char* err = nullptr;
 
-    if (!path || !scratch || scratchCap < 64) {
+    if (!scratch || scratchCap < 64) {
         if (errorOut) *errorOut = "internal: invalid scan buffer";
         return false;
     }
-    size_t cap = (maxFrameBytes < scratchCap) ? maxFrameBytes : scratchCap;
+    const size_t cap = (maxFrameBytes < scratchCap) ? maxFrameBytes : scratchCap;
+    out.fileBytes = totalBytes;
 
-    fs::File f = LittleFS.open(path, "r");
-    if (!f || f.isDirectory()) {
-        if (f) f.close();
-        if (errorOut) *errorOut = "file not found";
-        return false;
-    }
-    out.fileBytes = f.size();
-
-    FileSource src{&f};
-    mjpeg::Assembler<FileSource> asmb;
-    asmb.begin(&src, scratch, cap, kReadChunk, /*loop=*/false);
+    mjpeg::Assembler<Source> asmb;
+    asmb.begin(&src, scratch, cap, readChunk, /*loop=*/false);
     for (;;) {
         size_t len = 0;
         bool wrapped = false;
@@ -122,8 +138,6 @@ bool MjpegReader::validate(const char* path, uint16_t expectWidth, uint16_t expe
         break;
     }
 
-    f.close();
-
     if (!err && out.frames == 0) {
         err = "no JPEG frame found";
     }
@@ -131,6 +145,42 @@ bool MjpegReader::validate(const char* path, uint16_t expectWidth, uint16_t expe
         *errorOut = err;
     }
     return err == nullptr;
+}
+
+bool MjpegReader::validate(const char* path, uint16_t expectWidth, uint16_t expectHeight,
+                           size_t maxFrameBytes, uint8_t* scratch, size_t scratchCap,
+                           MjpegInfo& out, const char** errorOut) {
+    out = MjpegInfo();
+    if (!path) {
+        if (errorOut) *errorOut = "internal: no path";
+        return false;
+    }
+    fs::File f = LittleFS.open(path, "r");
+    if (!f || f.isDirectory()) {
+        if (f) f.close();
+        if (errorOut) *errorOut = "file not found";
+        return false;
+    }
+    FileSource src{&f};
+    const bool ok = validateWith(src, f.size(), kReadChunk, expectWidth, expectHeight, maxFrameBytes,
+                                 scratch, scratchCap, out, errorOut);
+    f.close();
+    return ok;
+}
+
+bool MjpegReader::validateMemory(const uint8_t* data, size_t size, uint16_t expectWidth,
+                                 uint16_t expectHeight, size_t maxFrameBytes, uint8_t* scratch,
+                                 size_t scratchCap, MjpegInfo& out, const char** errorOut) {
+    out = MjpegInfo();
+    if (!data || size == 0) {
+        if (errorOut) *errorOut = "no JPEG frame found";
+        return false;
+    }
+    mjpeg::MemorySource src;
+    src.data = data;
+    src.size = size;
+    return validateWith(src, size, kMemReadChunk, expectWidth, expectHeight, maxFrameBytes,
+                        scratch, scratchCap, out, errorOut);
 }
 
 }  // namespace sastle

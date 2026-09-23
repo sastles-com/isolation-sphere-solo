@@ -80,7 +80,7 @@ LittleFS の同梱物 1.35MB → **39KB**。
 | 境界 | 実装 |
 | --- | --- |
 | ネットワーク | SoftAP (既定 `isolation-sphere` / 192.168.4.1、常時) + 任意の STA (NVS の LAN > config の P2P 網) + キャプティブ DNS |
-| 映像入力 | `FramePump` (Core0、1 タスク) が UDP 配信 (`UdpReceiver` → `FrameReassembler`) とローカル `SoloPlayer::tick()` を調停 (`SourceArbiter`) し、`ImageManager::submitJpegFrame()` を呼ぶ唯一の場所 |
+| 映像入力 | `FramePump` (Core0、1 タスク) が UDP 配信 (`UdpReceiver` → `FrameReassembler`) とローカル `SoloPlayer::tick()` を調停 (`SourceArbiter`) し、`ImageManager::submitJpegFrame()` を呼ぶ唯一の場所。ローカル動画は open 時に **全体を PSRAM に読み込み**、再生中はフラッシュを読まない (§9 カクつき対策) |
 | 制御入力 | `SoloWebServer` (esp_http_server) / `CommandHandler` (MQTT) / `SerialConsole` → いずれも `DeviceController` |
 | 表示 | `LEDManager` レンダタスク (Core1) + IMU 再マッピング (`SphereMap.h`) |
 | ログ | `sastle::Log` = `RemoteLog`: Serial + (server モードでは) MQTT `sphere/<id>/log` (PSRAM 退避 12KB) |
@@ -622,6 +622,35 @@ ConfigManager のコンパイル時既定値で続行する。`ota.begin()` を 
 (IMU / LED / 再生 / Web) が止まっても無線の書き戻しが生き残るようにした
 (USB 端子に触れない筐体で、閉じた後に文鎮化する経路を潰す)。
 
+### 実機で確認したこと (2026-09-23, 統合ファーム Phase 0〜5 + カクつき対策, LAN 経由 OTA)
+
+利用者の実動画 (3.0MB / 565 フレーム / 平均 5KB/f) で「カクつく・時々止まる」が出た。`/api/status` に
+描画・デコード統計を足して切り分けた結果と対策:
+
+| 指標 | 旧 solo ファーム | 統合 (対策前) | 統合 (対策後) |
+| --- | --- | --- | --- |
+| 再生 fps / 締切落ち (静穏) | 7.2 / 9.6% | 7〜10 / 13% | **10.0 / 0%** |
+| 締切落ち (0.5s 間隔で /api/status を叩く) | — | 37% | **0%** |
+| LED 出力 1 回 (`render.out_us`) | 55ms (§9 既知) | 11ms | 10.5ms |
+| 描画 fps | ~17 | 25〜47 | 50 |
+| デコード 1 枚 (`img.decode_us`) | 55ms | 44〜411ms | 52〜64ms |
+
+- **原因 1: `/api/status` がフラッシュを読んでいた**。`LittleFS.usedBytes()` は全ブロック走査、
+  `LittleFS.open()` も読む。`spi_flash_read` は 1 回ごとに両コアのキャッシュを止めるので、httpd
+  (Core0, 当時 prio 2 > 再生 prio 1) がデコードを引き延ばし、Core1 の描画も止めていた。Web UI は
+  2 秒ごとに叩くため「UI を開いているとカクつく」。ポーリング間隔と締切落ちに用量反応があった
+  (静穏 13% → 0.5s 間隔 37%) ので因果は確定。対策: 使用量は起動時・アップロード/削除の前後だけ
+  再計算してキャッシュ、動画サイズは player の値を使う
+- **原因 2: 再生自体のフラッシュ読み** (`read_us` 最大 19ms = LED 出力中のフラッシュ操作ロック待ち)。
+  対策: open 時に動画全体を PSRAM に読み込む (`MjpegReader::openMemory`、3MB で 1.3 秒 = 2.2MB/s)。
+  再生中はフラッシュに一切触らない。PSRAM 確保に失敗したときだけ従来のフラッシュ直読みに退避
+- 併せて frame_pump を prio 2、httpd を prio 1 にして、状態表示やアップロード受信がデコードを奪わないようにした
+- `FASTLED_RMT_MEM_BLOCKS=1` で LED 出力は 55ms → 10.5ms (派生元の実測どおり)。§9 冒頭の「55-58ms
+  で原因不明」は解消。描画 50fps、IMU 追従も 50Hz に上がった
+- 残りの余裕: デコード 52〜64ms は本来の値 (TJpg_Decoder `JD_FASTDECODE=1`)。100ms 締切に対し
+  35〜45ms の余裕。さらに縮めるなら `JD_FASTDECODE=2` (ライブラリを `lib/` に同梱して設定変更、
+  内部 RAM +6KB) か、数フレーム先にデコードしておくリングが次の手
+
 ### 実機で未確認のこと (次にやる実機チェック)
 
 1. ~~起動と自動再生~~ → 確認済み (上表)
@@ -646,7 +675,8 @@ ConfigManager のコンパイル時既定値で続行する。`ota.begin()` を 
 ### 既知の制約
 
 - 音声・シーク・複数動画・プレイリスト・サムネイルは無い (要件どおり)
-- LED 出力が 1 フレーム 55-58ms かかる (FastLED RMT4 / 5 ストリップ > S3 の 4 チャンネル)。映像 10fps は間に合うが姿勢追従は 16.6Hz 止まり (§9)
+- ~~LED 出力が 1 フレーム 55-58ms かかる~~ → `FASTLED_RMT_MEM_BLOCKS=1` で 10.5ms に解消 (2026-09-23 実測)。描画 50fps
+- 動画は open 時に全体を PSRAM に読み込む (最大 3.9MB)。アップロード直後・起動直後に数秒の読み込み時間がある
 - 本体に組み込んだ状態では **USB 給電で映像を再生できない** (LED 800 個の電流に足りず、起動直後の
   オープニングや再生開始で電圧が落ち USB が切れる)。書き込みは USB で可、動作確認は LiPo で行う
 - ESP32 上で動画を変換する機能は無い。PC なら `tools/make_solo_video.sh`、iPhone 単体なら
@@ -710,9 +740,9 @@ MQTT: 受信 `sphere/<id>/command/#`、`sphere/all/command/#`、`sphere/all/cloc
 
 ### 実機検証手順 (未実施)
 
-1. **solo 退行なし** (`wifi.enabled=false` または旧 config): 起動、QR、再生 fps=10 miss=0、停止で黒、
-   一時停止、アップロード、明るさ (見た目が暗くなる: γ2.2)、`/api/status` の `source.active=local`、
-   `[PERF] src=local pump_stack=`、OTA (AP / LAN)。`[QDIAG]` の ortho/norm が 0 付近
+1. **solo 退行なし** (`wifi.enabled=false` または旧 config): ~~起動、再生 fps=10 miss=0、OTA (LAN)~~ →
+   確認済み (2026-09-23、§9 の表)。残り: QR、停止で黒、一時停止、アップロード (PSRAM 再読み込み)、
+   明るさ (見た目が暗くなる: γ2.2)、OTA (AP 経由)、`[QDIAG]` の ortho/norm が 0 付近
 2. **UDP 配信のみ** (server 不要): NVS の LAN に接続した状態で PC から
    `python3 tools/stream_to_sphere.py --target <STA IP> --fps 15` → 1 フレーム以内に `source.active=network`、
    `net_fps≈15`、`reasm_drop` が増えない。Ctrl-C → 約 2 秒後にローカルへ復帰 (Playing なら続き、

@@ -271,7 +271,9 @@ void setup() {
         pd.player = &soloPlayer;
         pd.udp = &udpRx;
         if (pump.begin(pd, config.getSourceConfig())) {
-            pump.startTask(0, 1, 8192);
+            // 優先度 2: httpd (prio 1) より上にして、/api/status の JSON 組み立てや
+            // アップロード受信にデコードが割り込まれないようにする (締切 100ms の保護)
+            pump.startTask(0, 2, 8192);
         } else {
             sastle::Log.println("FramePump initialization failed (no frame source)");
         }
@@ -281,6 +283,12 @@ void setup() {
             if (!udpRx.begin((uint16_t)wcfg.udp_port, config.getSourceConfig().udp_queue_len)) {
                 sastle::Log.println("UDP receiver failed to start (network video disabled)");
             }
+        }
+
+        // ローカル動画を開く (動画全体を PSRAM に読み込む。3MB で数秒)。描画タスクを起動する前に
+        // 行い、フラッシュ操作ロックの取り合いで読み込みが遅くなるのを避ける。
+        if (!soloPlayer.begin(config, imageManager)) {
+            sastle::Log.println("SoloPlayer initialization failed");
         }
     }
 
@@ -327,17 +335,14 @@ void setup() {
         deps.net = &network;
         deps.pump = &pump;
         deps.mqtt = &mqtt;
+        deps.image = &imageManager;
         controller.begin(deps);
         console.begin(controller, g_apSsid);
     }
 
-    // ローカル再生と Web UI を開始。
-    // 再生は FramePump が LittleFS 読み出し + JPEG デコードを 100ms 締切で回し、描画 (Core1)
+    // Web UI を開始。再生 (FramePump) は PSRAM 上の動画を 100ms 締切でデコードし、描画 (Core1)
     // とはトリプルバッファ経由で独立に動く。
     if (imageManager.isInitialized()) {
-        if (!soloPlayer.begin(config, imageManager)) {
-            sastle::Log.println("SoloPlayer initialization failed");
-        }
         if (network.isSoftAP()) {
             if (!soloWeb.begin(controller, config, soloPlayer, ledManager, network, imuSensor,
                                config.getSoloHttpPort(), &udpRx)) {

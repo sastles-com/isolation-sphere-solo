@@ -233,7 +233,8 @@ bool SoloWebServer::begin(DeviceController& ctl, ConfigManager& config, SoloPlay
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = port;
     cfg.core_id = 0;               // WiFi/lwIP・再生タスクと同じ Core0。描画(Core1)を汚さない
-    cfg.task_priority = 2;         // 既定(5)は高すぎるので描画タスクと同等まで下げる
+    cfg.task_priority = 1;         // 既定(5)は高すぎる。デコード (frame_pump, prio 2) より下に置き、
+                                   // 状態表示やアップロード受信が再生の締切を奪わないようにする
     cfg.stack_size = 8192;
     cfg.max_uri_handlers = 20;
     cfg.max_open_sockets = 4;
@@ -271,6 +272,7 @@ bool SoloWebServer::begin(DeviceController& ctl, ConfigManager& config, SoloPlay
         }
     }
     httpd_register_err_handler(_server, HTTPD_404_NOT_FOUND, onNotFound);
+    refreshFsUsage();
 
     // キャプティブポータル用 DNS (全ホスト名 → AP の IP)
     _dns.setTTL(60);
@@ -337,18 +339,15 @@ bool SoloWebServer::readBody(httpd_req_t* req, char* out, size_t cap, size_t& le
     return true;
 }
 
+void SoloWebServer::refreshFsUsage() {
+    _fsTotal = LittleFS.totalBytes();
+    _fsUsed = LittleFS.usedBytes();
+}
+
 size_t SoloWebServer::maxUploadBytes(size_t& freeOut, size_t& existingOut) const {
-    const size_t total = LittleFS.totalBytes();
-    const size_t used = LittleFS.usedBytes();
-    freeOut = (total > used) ? total - used : 0;
-    existingOut = 0;
-    if (_player) {
-        fs::File f = LittleFS.open(_player->videoPath().c_str(), "r");
-        if (f) {
-            existingOut = f.size();
-            f.close();
-        }
-    }
+    freeOut = (_fsTotal > _fsUsed) ? _fsTotal - _fsUsed : 0;
+    // 既存動画のサイズは player が open 時に把握している (ファイルを開き直さない)
+    existingOut = _player ? _player->videoBytes() : 0;
     // 既存動画は置換時に先に消せるので上限に含める
     const size_t avail = freeOut + existingOut;
     return (avail > kFsMargin) ? avail - kFsMargin : 0;
@@ -391,6 +390,13 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
         self->_imu->getCalibration(calSys, calGyro, calAccel, calMag);
     }
 
+    // 描画 (LED) とデコードの統計。カクつきの切り分け用: out_us が LED 出力 1 回の所要時間で、
+    // その間はフラッシュ操作ロックが握られ LittleFS 読み出しが待たされる
+    const LEDStats ls = self->_led->getStats();
+    ImageStats is = {};
+    if (self->_ctl->image()) {
+        is = self->_ctl->image()->getStats();
+    }
     // 映像ソース (FramePump) の統計。pump が無ければゼロ
     FramePump::Stats ps = {};
     uint32_t udpRx = 0, udpDrop = 0;
@@ -408,7 +414,7 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
     int n = snprintf(self->_jsonBuf, sizeof(self->_jsonBuf),
         "{\"device\":\"%s\",\"state\":\"%s\",\"error\":%s%s%s,"
         "\"video\":{\"present\":%s,\"path\":\"%s\",\"bytes\":%u,\"frames\":%u,\"duration_s\":%.1f,"
-        "\"width\":%u,\"height\":%u,\"max_frame_bytes\":%u},"
+        "\"width\":%u,\"height\":%u,\"max_frame_bytes\":%u,\"in_psram\":%s,\"load_ms\":%u},"
         "\"brightness\":%u,\"fps_target\":%u,"
         "\"stats\":{\"fps\":%.2f,\"frames\":%u,\"loops\":%u,\"deadline_misses\":%u,\"decode_errors\":%u,"
         "\"last_frame_bytes\":%u,\"read_us\":%u,\"tick_us\":%u},"
@@ -421,6 +427,8 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
         "\"led\":{\"mode\":\"%s\",\"pattern\":\"%s\",\"width\":%u,\"axis\":%s},"
         "\"imu\":{\"ok\":%s,\"mode\":%u,\"cal\":\"%u%u%u%u\","
         "\"quat\":[%.3f,%.3f,%.3f,%.3f],\"reads\":%u,\"fails\":%u,\"discards\":%u,\"partial\":%u,\"straddle\":%u,\"seq\":%u,\"smooth\":%u},"
+        "\"render\":{\"fps\":%.1f,\"frames\":%u,\"map_us\":%u,\"out_us\":%u,\"stale\":%u},"
+        "\"img\":{\"fps\":%.1f,\"decoded\":%u,\"decode_us\":%u,\"dropped\":%u,\"errors\":%u},"
         "\"uploads\":%u,\"upload_failures\":%u,"
         "\"uptime_s\":%lu,\"heap_free\":%u,\"psram_free\":%u}",
         self->_config->getSphereID().c_str(), p.stateName(),
@@ -428,11 +436,12 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
         p.hasVideo() ? "true" : "false", p.videoPath().c_str(), (unsigned)p.videoBytes(),
         (unsigned)p.videoFrames(), (float)p.videoFrames() / (float)kSoloFps,
         (unsigned)p.width(), (unsigned)p.height(), (unsigned)p.maxFrameBytes(),
+        p.playsFromMemory() ? "true" : "false", (unsigned)p.loadMs(),
         (unsigned)self->_ctl->brightnessPct(), (unsigned)kSoloFps,
         st.fps, (unsigned)st.frames, (unsigned)st.loops, (unsigned)st.deadlineMisses,
         (unsigned)st.decodeErrors, (unsigned)st.lastFrameBytes, (unsigned)st.lastReadUs,
         (unsigned)st.lastTickUs,
-        (unsigned)LittleFS.totalBytes(), (unsigned)LittleFS.usedBytes(), (unsigned)fsFree,
+        (unsigned)self->_fsTotal, (unsigned)self->_fsUsed, (unsigned)fsFree,
         (unsigned)maxUpload,
         WiFi.softAPSSID().c_str(), WiFi.softAPIP().toString().c_str(),
         (unsigned)WiFi.softAPgetStationNum(),
@@ -461,6 +470,10 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
         (unsigned)(self->_imu ? self->_imu->debugStraddles() : 0),
         (unsigned)(self->_imu ? self->_imu->quatSeq() : 0),
         (unsigned)(self->_imu ? self->_imu->smoothFrames() : 0),
+        ls.fps, (unsigned)ls.frames_rendered, (unsigned)ls.mapping_time_us, (unsigned)ls.output_time_us,
+        (unsigned)ls.imu_stale_frames,
+        is.fps, (unsigned)is.frames_decoded, (unsigned)is.decode_time_us, (unsigned)is.frames_dropped,
+        (unsigned)is.decode_errors,
         (unsigned)self->_uploads, (unsigned)self->_uploadFailures,
         (unsigned long)(millis() / 1000), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
     if (n < 0 || (size_t)n >= sizeof(self->_jsonBuf)) {
@@ -727,6 +740,7 @@ esp_err_t SoloWebServer::doUpload(httpd_req_t* req) {
     }
 
     size_t fsFree = 0, existing = 0;
+    refreshFsUsage();   // ここは実値が要る (書き込む直前)
     const size_t maxUpload = maxUploadBytes(fsFree, existing);
     if (len > maxUpload) {
         snprintf(_jsonBuf, sizeof(_jsonBuf),
@@ -805,6 +819,7 @@ esp_err_t SoloWebServer::doUpload(httpd_req_t* req) {
         LittleFS.remove(kTmpPath);
         _uploadFailures++;
         _player->endUpload();  // 旧動画が残っていればそれを再生、無ければ no_video
+        refreshFsUsage();
         Serial.printf("[SoloWeb] Upload failed: %s (received %u/%u bytes)\n", err, (unsigned)received, (unsigned)len);
         snprintf(_jsonBuf, sizeof(_jsonBuf),
                  "{\"ok\":false,\"error\":\"%s\",\"received\":%u,\"expected\":%u,\"replaced_before_upload\":%s,"
@@ -817,7 +832,8 @@ esp_err_t SoloWebServer::doUpload(httpd_req_t* req) {
     }
 
     _uploads++;
-    _player->endUpload();  // 新しい動画を先頭から再生
+    _player->endUpload();  // 新しい動画を先頭から再生 (PSRAM への読み込み込みで数秒かかる)
+    refreshFsUsage();
     Serial.printf("[SoloWeb] Upload ok: %u frames, %u bytes, max frame %u\n",
                   (unsigned)info.frames, (unsigned)info.fileBytes, (unsigned)info.maxFrameBytes);
     snprintf(_jsonBuf, sizeof(_jsonBuf),
@@ -839,6 +855,7 @@ esp_err_t SoloWebServer::onDelete(httpd_req_t* req) {
         removed = LittleFS.remove(path.c_str());
     }
     self->_player->endUpload();
+    self->refreshFsUsage();
     snprintf(self->_jsonBuf, sizeof(self->_jsonBuf), "{\"ok\":true,\"removed\":%s,\"state\":\"%s\"}",
              removed ? "true" : "false", self->_player->stateName());
     return self->sendJson(req, "200 OK", self->_jsonBuf);

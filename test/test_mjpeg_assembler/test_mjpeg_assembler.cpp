@@ -203,6 +203,44 @@ void test_empty_and_corrupt_streams() {
     }
 }
 
+// MjpegAssembler.h の MemorySource (PSRAM 上の動画から再生する実装の読み出し源)。
+// ループ再生で全フレームが元と一致し、巻き戻しが 1 回だけ報告されること。
+void test_memory_source_loops_and_matches(void) {
+    Bytes f0 = jpeg_synth::makeFrame(320, 160, jpeg_synth::entropy(700, 1));
+    Bytes f1 = jpeg_synth::makeFrame(320, 160, jpeg_synth::entropy(5000, 2));
+    Bytes f2 = jpeg_synth::makeFrame(320, 160, jpeg_synth::entropy(90, 3));
+    Bytes all;
+    jpeg_synth::append(all, f0.data(), f0.size());
+    jpeg_synth::append(all, f1.data(), f1.size());
+    jpeg_synth::append(all, f2.data(), f2.size());
+    const Bytes* frames[3] = {&f0, &f1, &f2};
+
+    sastle::mjpeg::MemorySource src;
+    src.data = all.data();
+    src.size = all.size();
+    std::vector<uint8_t> buf(65536);
+    Assembler<sastle::mjpeg::MemorySource> a;
+    a.begin(&src, buf.data(), buf.size(), 4096, /*loop=*/true);
+
+    for (int i = 0; i < 7; i++) {
+        size_t len = 0;
+        bool wrapped = false;
+        TEST_ASSERT_EQUAL((int)Status::Ok, (int)a.next(len, wrapped));
+        const Bytes& want = *frames[i % 3];
+        TEST_ASSERT_EQUAL_UINT32(want.size(), len);
+        TEST_ASSERT_EQUAL_MEMORY(want.data(), buf.data(), len);
+        TEST_ASSERT_EQUAL(i == 3 || i == 6, wrapped);
+    }
+    TEST_ASSERT_EQUAL_UINT32(2, a.loops());
+
+    // 空のメモリ源は Empty
+    sastle::mjpeg::MemorySource empty;
+    Assembler<sastle::mjpeg::MemorySource> b;
+    b.begin(&empty, buf.data(), buf.size(), 4096, true);
+    size_t len = 0; bool w = false;
+    TEST_ASSERT_EQUAL((int)Status::Empty, (int)b.next(len, w));
+}
+
 int main(int argc, char** argv) {
     (void)argc; (void)argv;
     UNITY_BEGIN();
@@ -213,5 +251,6 @@ int main(int argc, char** argv) {
     RUN_TEST(test_nonloop_reports_eof_and_truncated);
     RUN_TEST(test_too_large_frame);
     RUN_TEST(test_empty_and_corrupt_streams);
+    RUN_TEST(test_memory_source_loops_and_matches);
     return UNITY_END();
 }

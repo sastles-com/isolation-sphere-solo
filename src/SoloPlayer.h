@@ -111,6 +111,10 @@ public:
     uint16_t width() const { return _width; }
     uint16_t height() const { return _height; }
     size_t maxFrameBytes() const { return _frameCap; }
+    /// 動画を PSRAM から再生しているか (false = PSRAM 確保失敗でフラッシュ直読み)
+    bool playsFromMemory() const { return _reader.fromMemory(); }
+    /// 直近の PSRAM 読み込みにかかった時間 [ms]
+    uint32_t loadMs() const { return _loadMs; }
     Stats stats() const;
 
 private:
@@ -128,6 +132,9 @@ private:
 
     uint8_t* _frameBuf;   ///< PSRAM 上のフレーム組み立てバッファ
     size_t _frameCap;
+    uint8_t* _videoMem = nullptr;   ///< 動画全体の PSRAM コピー (再生中にフラッシュを読まない)
+    size_t _videoMemCap = 0;
+    uint32_t _loadMs = 0;
     MjpegReader _reader;
 
     SemaphoreHandle_t _mutex;

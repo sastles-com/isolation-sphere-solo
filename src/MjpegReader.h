@@ -1,8 +1,11 @@
 /**
  * @file MjpegReader.h
- * @brief LittleFS上の raw MJPEG を1フレームずつ読み出すリーダー
+ * @brief raw MJPEG を1フレームずつ読み出すリーダー (読み出し源: PSRAM 上のコピー、または LittleFS)
  * @note フレーム境界の判定は JpegScan.h (マーカー追跡) に委譲する。
  *       読み込みバッファ境界を跨ぐマーカーは NeedMore → 追記読み で解決する。
+ *
+ * 通常の再生は openMemory() で PSRAM 上のコピーから読む (再生中にフラッシュを読まない)。
+ * open() の LittleFS 直読みは PSRAM が確保できないときの退避経路。
  */
 
 #ifndef __MJPEG_READER_H__
@@ -28,7 +31,7 @@ struct MjpegInfo {
 
 /**
  * @class MjpegReader
- * @brief raw MJPEG ファイルの順次読み出し (EOFで先頭へループ)
+ * @brief raw MJPEG の順次読み出し (EOFで先頭へループ)
  *
  * フレームバッファは呼び出し側が確保して渡す (PSRAM を想定)。読み出したフレームは
  * そのバッファ先頭に置かれ、次に next() を呼ぶまで保たれる。先読みしたバイトはフレームの
@@ -46,19 +49,27 @@ public:
         TooLarge,  ///< 1フレームがバッファ上限を超える
     };
 
-    MjpegReader() : _fileBytes(0), _open(false) { _src.file = &_file; }
+    MjpegReader() : _fileBytes(0), _open(false), _fromMemory(false) { _src.file = &_file; }
     ~MjpegReader() { close(); }
 
     /**
-     * @brief MJPEGファイルを開く
+     * @brief MJPEGファイルを LittleFS から直接読む形で開く (退避経路)
      * @param path      ファイルパス
      * @param frameBuf  フレーム組み立てバッファ (呼び出し側所有)
      * @param frameCap  frameBuf の容量 = 受理する1フレームの上限サイズ
      */
     bool open(const char* path, uint8_t* frameBuf, size_t frameCap);
 
+    /**
+     * @brief メモリ (PSRAM) 上の MJPEG を開く。再生中にフラッシュを読まない
+     * @param data  MJPEG 全体 (呼び出し側所有。close() まで有効であること)
+     * @param size  バイト数
+     */
+    bool openMemory(const uint8_t* data, size_t size, uint8_t* frameBuf, size_t frameCap);
+
     void close();
     bool isOpen() const { return _open; }
+    bool fromMemory() const { return _open && _fromMemory; }
 
     /**
      * @brief 次の完全な1フレームをバッファ先頭に読み出す
@@ -68,7 +79,7 @@ public:
     Status next(size_t& outSize, bool& wrapped);
 
     size_t fileBytes() const { return _fileBytes; }
-    uint32_t loops() const { return _asm.loops(); }
+    uint32_t loops() const { return _fromMemory ? _asmMem.loops() : _asm.loops(); }
 
     /**
      * @brief ファイル全体を走査して受理可否を判定する (アップロード検証用)
@@ -89,6 +100,11 @@ public:
                          size_t maxFrameBytes, uint8_t* scratch, size_t scratchCap,
                          MjpegInfo& out, const char** errorOut);
 
+    /// validate() のメモリ版 (PSRAM に読み込んだ後の検証。フラッシュを読み直さない)
+    static bool validateMemory(const uint8_t* data, size_t size, uint16_t expectWidth,
+                               uint16_t expectHeight, size_t maxFrameBytes, uint8_t* scratch,
+                               size_t scratchCap, MjpegInfo& out, const char** errorOut);
+
 private:
     /// LittleFS の File を MjpegAssembler の読み出し源として包む
     struct FileSource {
@@ -97,11 +113,19 @@ private:
         void rewind() { if (file) file->seek(0); }
     };
 
+    template <typename Source>
+    static bool validateWith(Source& src, size_t totalBytes, size_t readChunk, uint16_t expectWidth,
+                             uint16_t expectHeight, size_t maxFrameBytes, uint8_t* scratch,
+                             size_t scratchCap, MjpegInfo& out, const char** errorOut);
+
     fs::File _file;
     FileSource _src;
     mjpeg::Assembler<FileSource> _asm;
+    mjpeg::MemorySource _memSrc;
+    mjpeg::Assembler<mjpeg::MemorySource> _asmMem;
     size_t _fileBytes;
     bool _open;
+    bool _fromMemory;
 };
 
 }  // namespace sastle

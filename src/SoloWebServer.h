@@ -86,7 +86,10 @@ private:
     esp_err_t sendJson(httpd_req_t* req, const char* status, const char* json);
     esp_err_t sendError(httpd_req_t* req, const char* status, const char* message);
     bool readBody(httpd_req_t* req, char* out, size_t cap, size_t& len);
+    /// 空き容量からアップロード上限を出す (キャッシュ済みの使用量と player の動画サイズから。フラッシュは読まない)
     size_t maxUploadBytes(size_t& freeOut, size_t& existingOut) const;
+    /// LittleFS の使用量を再計算してキャッシュする (起動時・アップロード/削除の前後のみ。全ブロック走査 = フラッシュ読み)
+    void refreshFsUsage();
 
     httpd_handle_t _server;
     // キャプティブポータル: 全ドメインを AP 自身の IP に解決し、未知パスは "/" へ 302。
@@ -102,8 +105,13 @@ private:
     IMUManager* _imu;
     UdpReceiver* _udp = nullptr;   ///< 統計表示用 (nullptr 可)
 
+    // LittleFS の使用量キャッシュ。usedBytes() は全ブロックを走査してフラッシュを読み、その間
+    // 両コアのキャッシュが止まる。/api/status (Web UI が 2 秒ごと) から呼ぶと再生がカクつく
+    // (実機 2026-09-23: 0.5s 間隔のポーリングで締切落ち 37%) ので、状態表示はこの値を使う。
+    size_t _fsTotal = 0;
+    size_t _fsUsed = 0;
     uint8_t* _rxBuf;              ///< 受信作業バッファ (ヒープ)
-    char _jsonBuf[1536];          ///< 応答組み立て (ハンドラは httpd タスクで直列実行)
+    char _jsonBuf[2048];          ///< 応答組み立て (ハンドラは httpd タスクで直列実行)
     uint32_t _uploads;
     uint32_t _uploadFailures;
 };

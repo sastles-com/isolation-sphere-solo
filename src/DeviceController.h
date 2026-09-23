@@ -39,6 +39,7 @@ public:
         NetworkManager* net = nullptr;
         FramePump* pump = nullptr;
         MQTTManager* mqtt = nullptr;     ///< server 未設定なら nullptr
+        ImageManager* image = nullptr;   ///< 統計の読み出し用
     };
 
     enum class PlayResult : uint8_t { Ok, NoVideo, Uploading, Unavailable };
@@ -126,6 +127,7 @@ public:
     ConfigManager* config() const { return _d.config; }
     FramePump* pump() const { return _d.pump; }
     MQTTManager* mqtt() const { return _d.mqtt; }
+    ImageManager* image() const { return _d.image; }
     bool mqttConnected() const { return _d.mqtt && _d.mqtt->isConnected(); }
 
 private:

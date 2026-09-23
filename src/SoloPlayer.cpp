@@ -11,8 +11,8 @@
 namespace sastle {
 
 namespace {
-constexpr int64_t kPeriodUs = 1000000LL / kSoloFps;  ///< 100ms @10fps
 constexpr TickType_t kMutexWait = pdMS_TO_TICKS(50);
+constexpr size_t kLoadChunk = 16384;   ///< PSRAM への読み込み単位
 }  // namespace
 
 SoloPlayer::SoloPlayer()
@@ -40,6 +40,10 @@ SoloPlayer::SoloPlayer()
 
 SoloPlayer::~SoloPlayer() {
     _reader.close();
+    if (_videoMem) {
+        free(_videoMem);
+        _videoMem = nullptr;
+    }
     if (_frameBuf) {
         free(_frameBuf);
         _frameBuf = nullptr;
@@ -165,6 +169,7 @@ bool SoloPlayer::validateFile(const char* path, MjpegInfo& info, const char** er
 bool SoloPlayer::openVideoLocked() {
     _videoBytes = 0;
     _videoFrames = 0;
+    _loadMs = 0;
 
     if (!LittleFS.exists(_videoPath.c_str())) {
         _state = State::NoVideo;
@@ -173,18 +178,74 @@ bool SoloPlayer::openVideoLocked() {
         return false;
     }
 
-    // 起動時/差し替え時にファイル全体を検証し、部分ファイルや解像度違いを再生しない。
+    // 動画全体を PSRAM に読み込む。再生中に LittleFS を読むと、1 回ごとに両コアのキャッシュが
+    // 止まり (spi_flash_read)、描画 (core1) もデコード (core0) も引き延ばされて締切落ちになる
+    // (実機 2026-09-23)。起動/差し替え時に 1 回だけ読み、以降はフラッシュに触らない。
     MjpegInfo info;
     const char* err = nullptr;
-    if (!MjpegReader::validate(_videoPath.c_str(), _width, _height, _frameCap,
-                               _frameBuf, _frameCap, info, &err)) {
+    size_t size = 0;
+    {
+        fs::File f = LittleFS.open(_videoPath.c_str(), "r");
+        if (!f || f.isDirectory()) {
+            if (f) f.close();
+            setErrorLocked("failed to open video file");
+            return false;
+        }
+        size = f.size();
+        if (size == 0) {
+            f.close();
+            setErrorLocked("no JPEG frame found");
+            return false;
+        }
+        if (!_videoMem || _videoMemCap < size) {
+            if (_videoMem) {
+                free(_videoMem);
+                _videoMem = nullptr;
+                _videoMemCap = 0;
+            }
+            _videoMem = (uint8_t*)ps_malloc(size);
+            _videoMemCap = _videoMem ? size : 0;
+        }
+        if (_videoMem) {
+            const uint32_t t0 = millis();
+            size_t got = 0;
+            while (got < size) {
+                const size_t want = (size - got) < kLoadChunk ? (size - got) : kLoadChunk;
+                const size_t n = f.read(_videoMem + got, want);
+                if (n == 0) break;
+                got += n;
+            }
+            _loadMs = millis() - t0;
+            f.close();
+            if (got != size) {
+                setErrorLocked("failed to read video file");
+                Serial.printf("[SoloPlayer] short read: %u/%u bytes\n", (unsigned)got, (unsigned)size);
+                return false;
+            }
+            Serial.printf("[SoloPlayer] loaded %u bytes into PSRAM in %lu ms (%.1f MB/s)\n",
+                          (unsigned)size, (unsigned long)_loadMs,
+                          _loadMs ? (size / 1048576.0f) / (_loadMs / 1000.0f) : 0.0f);
+        } else {
+            f.close();
+            Serial.printf("[SoloPlayer] WARN: PSRAM alloc %u bytes failed - playing from flash (expect stutter)\n",
+                          (unsigned)size);
+        }
+    }
+
+    // 起動時/差し替え時にファイル全体を検証し、部分ファイルや解像度違いを再生しない。
+    const bool ok = _videoMem
+        ? MjpegReader::validateMemory(_videoMem, size, _width, _height, _frameCap, _frameBuf, _frameCap, info, &err)
+        : MjpegReader::validate(_videoPath.c_str(), _width, _height, _frameCap, _frameBuf, _frameCap, info, &err);
+    if (!ok) {
         setErrorLocked(err ? err : "invalid video file");
         Serial.printf("[SoloPlayer] video rejected: %s (got %ux%u, %u frames)\n",
                       _lastError, info.width, info.height, (unsigned)info.frames);
         return false;
     }
 
-    if (!_reader.open(_videoPath.c_str(), _frameBuf, _frameCap)) {
+    const bool opened = _videoMem ? _reader.openMemory(_videoMem, size, _frameBuf, _frameCap)
+                                  : _reader.open(_videoPath.c_str(), _frameBuf, _frameCap);
+    if (!opened) {
         setErrorLocked("failed to open video file");
         return false;
     }
@@ -193,14 +254,21 @@ bool SoloPlayer::openVideoLocked() {
     _videoFrames = info.frames;
     _lastError = nullptr;
     _state = State::Playing;
-    Serial.printf("[SoloPlayer] video ok: %u frames, %u bytes, max frame %u bytes (%.1fs @%ufps)\n",
+    Serial.printf("[SoloPlayer] video ok: %u frames, %u bytes, max frame %u bytes (%.1fs @%ufps) source=%s\n",
                   (unsigned)info.frames, (unsigned)info.fileBytes, (unsigned)info.maxFrameBytes,
-                  (float)info.frames / (float)kSoloFps, (unsigned)kSoloFps);
+                  (float)info.frames / (float)kSoloFps, (unsigned)kSoloFps,
+                  _reader.fromMemory() ? "psram" : "flash");
     return true;
 }
 
 void SoloPlayer::closeVideoLocked() {
     _reader.close();
+    if (_videoMem) {
+        // 差し替え/削除のときだけ来る (stop/pause では呼ばれない)。次の open で再確保する
+        free(_videoMem);
+        _videoMem = nullptr;
+        _videoMemCap = 0;
+    }
     if (_state == State::Playing || _state == State::Paused || _state == State::Stopped) {
         _state = State::NoVideo;
     }

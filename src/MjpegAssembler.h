@@ -24,6 +24,29 @@
 namespace sastle {
 namespace mjpeg {
 
+/**
+ * @brief メモリ上のバイト列を読み出し源にする (PSRAM に載せた動画の再生用)
+ *
+ * 再生中にフラッシュを一切読まないための Source。LittleFS 読み出しは 1 回ごとに両コアの
+ * キャッシュを止めるため、描画 (別コア) とデコード (同コア) の両方を遅らせていた (実機 2026-09-23:
+ * /api/status のフラッシュ走査と重なると 1 フレームのデコードが 400ms まで伸び、締切落ちが 13〜37%)。
+ */
+struct MemorySource {
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    size_t pos = 0;
+
+    size_t read(uint8_t* dst, size_t maxBytes) {
+        if (!data || pos >= size) return 0;
+        size_t n = size - pos;
+        if (n > maxBytes) n = maxBytes;
+        memcpy(dst, data + pos, n);
+        pos += n;
+        return n;
+    }
+    void rewind() { pos = 0; }
+};
+
 /// next() の結果
 enum class Status : uint8_t {
     Ok,         ///< 1フレーム取得 (buf 先頭に置かれている)
