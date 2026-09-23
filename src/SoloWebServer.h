@@ -26,6 +26,7 @@
 #include <esp_http_server.h>
 
 #include "ConfigManager.h"
+#include "DeviceController.h"
 #include "LEDManager.h"
 #include "IMUManager.h"
 #include "NetworkManager.h"
@@ -40,18 +41,19 @@ public:
 
     /**
      * @brief HTTP サーバーを起動する
-     * @param config  設定 (モード永続化に使う)
-     * @param player  再生制御
-     * @param led     明るさ制御
+     * @param ctl     操作の窓口 (再生/明るさ/LED/IMU/再起動は全てここへ委譲する)
+     * @param config  設定 (captive_portal / sphere id)
+     * @param player  再生統計の読み出し
+     * @param led     LED 統計の読み出し
      * @param port    リッスンポート
      */
-    bool begin(ConfigManager& config, SoloPlayer& player, LEDManager& led,
+    bool begin(DeviceController& ctl, ConfigManager& config, SoloPlayer& player, LEDManager& led,
                NetworkManager& net, IMUManager& imu, uint16_t port);
     void end();
     bool isRunning() const { return _server != nullptr; }
 
     /**
-     * @brief loop() から呼ぶ。キャプティブ DNS の応答と、再起動要求の実行。
+     * @brief loop() から呼ぶ。キャプティブ DNS の応答 (再起動・設定保存は DeviceController::tick)。
      */
     void loop();
 
@@ -70,6 +72,7 @@ private:
     static esp_err_t onLed(httpd_req_t* req);
     static esp_err_t onImuGet(httpd_req_t* req);
     static esp_err_t onImuPost(httpd_req_t* req);
+    static esp_err_t onServer(httpd_req_t* req);
 
     static esp_err_t onBrightness(httpd_req_t* req);
     static esp_err_t onUpload(httpd_req_t* req);
@@ -81,8 +84,6 @@ private:
     esp_err_t sendJson(httpd_req_t* req, const char* status, const char* json);
     esp_err_t sendError(httpd_req_t* req, const char* status, const char* message);
     bool readBody(httpd_req_t* req, char* out, size_t cap, size_t& len);
-    void applyBrightness(uint8_t percent);
-    void scheduleReboot(uint32_t delayMs);
     size_t maxUploadBytes(size_t& freeOut, size_t& existingOut) const;
 
     httpd_handle_t _server;
@@ -91,6 +92,7 @@ private:
     DNSServer _dns;
     bool _uiServed = false;  ///< Web UI を一度でも返したか (LCD の案内 QR 切り替え用)
     bool _dnsStarted = false;
+    DeviceController* _ctl;
     ConfigManager* _config;
     SoloPlayer* _player;
     LEDManager* _led;
@@ -98,9 +100,7 @@ private:
     IMUManager* _imu;
 
     uint8_t* _rxBuf;              ///< 受信作業バッファ (ヒープ)
-    char _jsonBuf[1024];          ///< 応答組み立て (ハンドラは httpd タスクで直列実行)
-    uint8_t _brightnessPct;
-    volatile uint32_t _rebootAtMs;  ///< 0 = 予約なし
+    char _jsonBuf[1536];          ///< 応答組み立て (ハンドラは httpd タスクで直列実行)
     uint32_t _uploads;
     uint32_t _uploadFailures;
 };

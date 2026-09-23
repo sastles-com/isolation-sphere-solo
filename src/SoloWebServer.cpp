@@ -104,6 +104,12 @@ small{color:#888}#msg{min-height:1.2em;color:#f5b041;font-size:14px;word-break:b
  <div class="row"><button id="wifi">保存</button></div>
 </div>
 <div class="card">
+ <div class="k">サーバ接続 (映像配信サーバがある環境向け)</div>
+ <div class="row"><span class="k">状態</span><span id="srv" class="v">-</span></div>
+ <p><small>ON にすると起動時に配信サーバの Wi-Fi (P2P 網) にも接続し、UDP で届く映像を優先して表示、MQTT で操作を受けます。映像が届かない間は本体の動画を再生します。OFF は本体だけで動作します。切り替えは保存して再起動します (この AP と本体の動画はどちらでも使えます)。</small></p>
+ <div class="row"><button id="srv_on">ON にして再起動</button><button id="srv_off" class="gray">OFF にして再起動</button></div>
+</div>
+<div class="card">
  <div class="row"><span class="k">デバイス</span><span id="dev" class="v">-</span></div>
  <div class="row"><span class="k">LAN (STA)</span><span id="sta" class="v">-</span></div>
  <div class="row"><button id="reboot" class="gray">再起動</button></div>
@@ -132,8 +138,10 @@ async function refresh(){if(busy)return;try{const r=await fetch('/api/status',{c
   sel('p_strip',L.pattern==='strip');sel('p_chase',L.pattern==='chase');
   sel('axis',L.axis);$('axis').textContent=L.axis?'XYZ軸を重ねる (ON)':'XYZ軸を重ねる';
   if(document.activeElement!==$('w')){$('w').value=L.width;$('wval').textContent=L.width}}
- if(s.sta){$('sta').textContent=!s.sta.enabled?'未設定':(s.sta.connected?`${s.sta.ssid} ${s.sta.ip}`:`${s.sta.ssid} 接続中…`);
-  if(document.activeElement!==$('ssid')&&!$('ssid').value&&s.sta.ssid)$('ssid').placeholder=s.sta.ssid}
+ if(s.sta){$('sta').textContent=!s.sta.enabled?'未設定':(s.sta.connected?`${s.sta.ssid} ${s.sta.ip} (${s.sta.origin})`:`${s.sta.ssid} 接続中… (${s.sta.origin})`);
+  if(document.activeElement!==$('ssid')&&!$('ssid').value&&s.sta.origin==='nvs'&&s.sta.ssid)$('ssid').placeholder=s.sta.ssid}
+ if(s.server){const S=s.server;$('srv').textContent=S.enabled&&S.ssid?`ON: ${S.ssid} / ${S.broker}`:'OFF (本体のみ)';
+  $('srv_on').className=S.enabled?'':'gray';$('srv_off').className=S.enabled?'gray':''}
  $('play').disabled=!(s.state==='stopped'||s.state==='paused');$('pause').disabled=s.state!=='playing';$('stop').disabled=!(s.state==='playing'||s.state==='paused');
  $('del').disabled=!s.video.present||s.state==='uploading';
  $('conv').style.opacity=s.state==='uploading'?.4:1;
@@ -151,6 +159,8 @@ $('axis').onclick=()=>led({axis:!ledAxis});
 $('w').oninput=e=>{$('wval').textContent=e.target.value;clearTimeout(wTimer);wTimer=setTimeout(()=>led({width:+e.target.value}),250)};
 $('del').onclick=()=>{if(confirm('保存済み動画を削除しますか？'))api('/api/video/delete').then(refresh).catch(e=>say(e.message))};
 $('reboot').onclick=()=>{if(confirm('再起動しますか？'))api('/api/reboot').then(()=>say('再起動中…')).catch(e=>say(e.message))};
+const srv=on=>{if(confirm(`サーバ接続を ${on?'ON':'OFF'} にして再起動しますか？`))api('/api/server',{enabled:on}).then(()=>say('保存しました。再起動中…')).catch(e=>say(e.message))};
+$('srv_on').onclick=()=>srv(true);$('srv_off').onclick=()=>srv(false);
 $('i_sm').oninput=e=>{$('i_smv').textContent=e.target.value;clearTimeout(smTimer);smTimer=setTimeout(()=>api('/api/imu',{smooth_frames:+e.target.value}).then(refresh).catch(e=>say(e.message)),250)};
 $('i_reset').onclick=()=>{if(confirm('IMU (BNO055) を再初期化しますか？'))api('/api/imu',{reset:true}).then(()=>say('IMU を再初期化しました')).catch(e=>say(e.message))};
 $('wifi').onclick=()=>{const sd=$('ssid').value.trim();
@@ -167,14 +177,13 @@ refresh();setInterval(refresh,2000);
 
 SoloWebServer::SoloWebServer()
     : _server(nullptr),
+      _ctl(nullptr),
       _config(nullptr),
       _player(nullptr),
       _led(nullptr),
       _net(nullptr),
       _imu(nullptr),
       _rxBuf(nullptr),
-      _brightnessPct(50),
-      _rebootAtMs(0),
       _uploads(0),
       _uploadFailures(0) {
     _jsonBuf[0] = '\0';
@@ -188,18 +197,17 @@ SoloWebServer::~SoloWebServer() {
     }
 }
 
-bool SoloWebServer::begin(ConfigManager& config, SoloPlayer& player, LEDManager& led,
-                          NetworkManager& net, IMUManager& imu, uint16_t port) {
+bool SoloWebServer::begin(DeviceController& ctl, ConfigManager& config, SoloPlayer& player,
+                          LEDManager& led, NetworkManager& net, IMUManager& imu, uint16_t port) {
     if (_server) {
         return true;
     }
+    _ctl = &ctl;
     _config = &config;
     _player = &player;
     _led = &led;
     _net = &net;
     _imu = &imu;
-    // 利用者が UI で変えた値 (NVS) を優先し、無ければ config.json の既定値を使う
-    _brightnessPct = Settings::brightness(config.getParamBrightness());
 
     if (!_rxBuf) {
         _rxBuf = (uint8_t*)malloc(kRxBufSize);
@@ -214,7 +222,7 @@ bool SoloWebServer::begin(ConfigManager& config, SoloPlayer& player, LEDManager&
     cfg.core_id = 0;               // WiFi/lwIP・再生タスクと同じ Core0。描画(Core1)を汚さない
     cfg.task_priority = 2;         // 既定(5)は高すぎるので描画タスクと同等まで下げる
     cfg.stack_size = 8192;
-    cfg.max_uri_handlers = 16;
+    cfg.max_uri_handlers = 20;
     cfg.max_open_sockets = 4;
     cfg.lru_purge_enable = true;
     cfg.recv_wait_timeout = 30;
@@ -237,6 +245,7 @@ bool SoloWebServer::begin(ConfigManager& config, SoloPlayer& player, LEDManager&
         {"/api/led",          HTTP_POST, onLed,        this, false, false, nullptr},
         {"/api/imu",          HTTP_GET,  onImuGet,     this, false, false, nullptr},
         {"/api/imu",          HTTP_POST, onImuPost,    this, false, false, nullptr},
+        {"/api/server",       HTTP_POST, onServer,     this, false, false, nullptr},
         {"/api/brightness",   HTTP_POST, onBrightness, this, false, false, nullptr},
         {"/api/video",        HTTP_POST, onUpload,     this, false, false, nullptr},
         {"/api/video/delete", HTTP_POST, onDelete,     this, false, false, nullptr},
@@ -274,15 +283,8 @@ void SoloWebServer::end() {
 }
 
 void SoloWebServer::loop() {
-    Settings::tick();  // 保留中の設定変更を書き出す
     if (_dnsStarted) {
         _dns.processNextRequest();
-    }
-    if (_rebootAtMs != 0 && (int32_t)(millis() - _rebootAtMs) >= 0) {
-        Serial.println("[SoloWeb] Restarting as requested via HTTP");
-        Serial.flush();
-        delay(50);
-        ESP.restart();
     }
 }
 
@@ -319,21 +321,6 @@ bool SoloWebServer::readBody(httpd_req_t* req, char* out, size_t cap, size_t& le
     }
     out[len] = '\0';
     return true;
-}
-
-void SoloWebServer::applyBrightness(uint8_t percent) {
-    Settings::setBrightness(percent);  // 遅延保存 (スライダー操作をまとめて 1 回書く)
-    if (percent > 100) percent = 100;
-    _brightnessPct = percent;
-    if (_led) {
-        _led->setBrightness((uint8_t)map(percent, 0, 100, 0, 255));
-    }
-}
-
-void SoloWebServer::scheduleReboot(uint32_t delayMs) {
-    Settings::flush();  // 再起動で失わないよう確定させる
-    _rebootAtMs = millis() + delayMs;
-    if (_rebootAtMs == 0) _rebootAtMs = 1;
 }
 
 size_t SoloWebServer::maxUploadBytes(size_t& freeOut, size_t& existingOut) const {
@@ -401,6 +388,7 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
         "\"fs\":{\"total\":%u,\"used\":%u,\"free\":%u,\"max_upload\":%u},"
         "\"ap\":{\"ssid\":\"%s\",\"ip\":\"%s\",\"clients\":%u},"
         "\"sta\":{\"enabled\":%s,\"connected\":%s,\"ssid\":\"%s\",\"ip\":\"%s\",\"origin\":\"%s\"},"
+        "\"server\":{\"configured\":%s,\"enabled\":%s,\"ssid\":\"%s\",\"broker\":\"%s\"},"
         "\"led\":{\"mode\":\"%s\",\"pattern\":\"%s\",\"width\":%u,\"axis\":%s},"
         "\"imu\":{\"ok\":%s,\"mode\":%u,\"cal\":\"%u%u%u%u\","
         "\"quat\":[%.3f,%.3f,%.3f,%.3f],\"reads\":%u,\"fails\":%u,\"discards\":%u,\"partial\":%u,\"straddle\":%u,\"seq\":%u,\"smooth\":%u},"
@@ -411,7 +399,7 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
         p.hasVideo() ? "true" : "false", p.videoPath().c_str(), (unsigned)p.videoBytes(),
         (unsigned)p.videoFrames(), (float)p.videoFrames() / (float)kSoloFps,
         (unsigned)p.width(), (unsigned)p.height(), (unsigned)p.maxFrameBytes(),
-        (unsigned)self->_brightnessPct, (unsigned)kSoloFps,
+        (unsigned)self->_ctl->brightnessPct(), (unsigned)kSoloFps,
         st.fps, (unsigned)st.frames, (unsigned)st.loops, (unsigned)st.deadlineMisses,
         (unsigned)st.decodeErrors, (unsigned)st.lastFrameBytes, (unsigned)st.lastReadUs,
         (unsigned)st.lastTickUs,
@@ -424,11 +412,11 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
         self->_net ? self->_net->staSsid().c_str() : "",
         self->_net && self->_net->staConnected() ? WiFi.localIP().toString().c_str() : "",
         self->_net ? self->_net->staOriginName() : "none",
-        self->_led->getOutputMode() == LEDManager::OutputMode::Test ? "test"
-            : (self->_led->getOutputMode() == LEDManager::OutputMode::Manual ? "manual" : "sphere"),
-        self->_led->getTestPattern() == LEDManager::TestPattern::Chase ? "chase" : "strip",
-        (unsigned)self->_led->getTestWidth(),
-        self->_led->getAxisIndicator() ? "true" : "false",
+        self->_ctl->serverConfigured() ? "true" : "false",
+        self->_config->getWiFiConfig().enabled ? "true" : "false",
+        self->_config->getWiFiSSID().c_str(), self->_config->getMQTTBroker().c_str(),
+        self->_ctl->ledModeName(), self->_ctl->testPatternName(), (unsigned)self->_ctl->testWidth(),
+        self->_ctl->axisIndicator() ? "true" : "false",
         imuOk ? "true" : "false", (unsigned)imuMode,
         (unsigned)calSys, (unsigned)calGyro, (unsigned)calAccel, (unsigned)calMag,
         iqw, iqx, iqy, iqz,
@@ -447,36 +435,60 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
     return self->sendJson(req, "200 OK", self->_jsonBuf);
 }
 
+// 再生系 3 本の共通応答: 409 は「アップロード中」「動画なし」
+static esp_err_t replyPlayResult(SoloWebServer* self, httpd_req_t* req, DeviceController::PlayResult r,
+                                 char* buf, size_t cap, const char* stateName,
+                                 esp_err_t (SoloWebServer::*sendJsonFn)(httpd_req_t*, const char*, const char*),
+                                 esp_err_t (SoloWebServer::*sendErrorFn)(httpd_req_t*, const char*, const char*)) {
+    if (r != DeviceController::PlayResult::Ok) {
+        return (self->*sendErrorFn)(req, "409 Conflict", DeviceController::playResultMessage(r));
+    }
+    snprintf(buf, cap, "{\"ok\":true,\"state\":\"%s\"}", stateName);
+    return (self->*sendJsonFn)(req, "200 OK", buf);
+}
+
 esp_err_t SoloWebServer::onPlay(httpd_req_t* req) {
     auto* self = static_cast<SoloWebServer*>(req->user_ctx);
-    if (self->_player->state() == SoloPlayer::State::Uploading) {
-        return self->sendError(req, "409 Conflict", "upload in progress");
-    }
-    if (!self->_player->hasVideo()) {
-        return self->sendError(req, "409 Conflict", "no video");
-    }
-    self->_player->play();
-    snprintf(self->_jsonBuf, sizeof(self->_jsonBuf), "{\"ok\":true,\"state\":\"%s\"}", self->_player->stateName());
-    return self->sendJson(req, "200 OK", self->_jsonBuf);
+    return replyPlayResult(self, req, self->_ctl->play(), self->_jsonBuf, sizeof(self->_jsonBuf),
+                           self->_player->stateName(), &SoloWebServer::sendJson, &SoloWebServer::sendError);
 }
 
 esp_err_t SoloWebServer::onStop(httpd_req_t* req) {
     auto* self = static_cast<SoloWebServer*>(req->user_ctx);
-    if (self->_player->state() == SoloPlayer::State::Uploading) {
-        return self->sendError(req, "409 Conflict", "upload in progress");
-    }
-    self->_player->stop();
-    snprintf(self->_jsonBuf, sizeof(self->_jsonBuf), "{\"ok\":true,\"state\":\"%s\"}", self->_player->stateName());
-    return self->sendJson(req, "200 OK", self->_jsonBuf);
+    return replyPlayResult(self, req, self->_ctl->stop(), self->_jsonBuf, sizeof(self->_jsonBuf),
+                           self->_player->stateName(), &SoloWebServer::sendJson, &SoloWebServer::sendError);
 }
 
 esp_err_t SoloWebServer::onPause(httpd_req_t* req) {
     auto* self = static_cast<SoloWebServer*>(req->user_ctx);
-    if (self->_player->state() == SoloPlayer::State::Uploading) {
-        return self->sendError(req, "409 Conflict", "upload in progress");
+    return replyPlayResult(self, req, self->_ctl->pause(), self->_jsonBuf, sizeof(self->_jsonBuf),
+                           self->_player->stateName(), &SoloWebServer::sendJson, &SoloWebServer::sendError);
+}
+
+// server 接続 (config.json wifi.enabled) の切り替え: {"enabled":bool}。保存後に再起動して反映。
+// config.json は LittleFS 上にあり OTA では更新できないため、球体側で書き換える経路。
+esp_err_t SoloWebServer::onServer(httpd_req_t* req) {
+    auto* self = static_cast<SoloWebServer*>(req->user_ctx);
+    char body[96];
+    size_t len = 0;
+    if (!self->readBody(req, body, sizeof(body), len)) {
+        return self->sendError(req, "400 Bad Request", "invalid body");
     }
-    self->_player->pause();
-    snprintf(self->_jsonBuf, sizeof(self->_jsonBuf), "{\"ok\":true,\"state\":\"%s\"}", self->_player->stateName());
+    StaticJsonDocument<128> doc;
+    if (deserializeJson(doc, body, len) != DeserializationError::Ok || !doc.containsKey("enabled")) {
+        return self->sendError(req, "400 Bad Request", "expected {\\\"enabled\\\":bool}");
+    }
+    const bool on = doc["enabled"] | false;
+    if (!self->_ctl->setServerEnabled(on)) {
+        return self->sendError(req, "500 Internal Server Error", "failed to save config.json");
+    }
+    const bool reboot = doc["reboot"] | true;
+    if (reboot) {
+        self->_ctl->stop();
+        self->_ctl->scheduleReboot(800);
+    }
+    snprintf(self->_jsonBuf, sizeof(self->_jsonBuf), "{\"ok\":true,\"enabled\":%s,\"reboot_in_ms\":%d}",
+             on ? "true" : "false", reboot ? 800 : 0);
     return self->sendJson(req, "200 OK", self->_jsonBuf);
 }
 
@@ -517,43 +529,34 @@ esp_err_t SoloWebServer::onLed(httpd_req_t* req) {
         return self->sendError(req, "400 Bad Request", "invalid json");
     }
 
-    // 指定されたキーだけを反映する (mode / pattern / width / axis はそれぞれ独立)
-    if (doc.containsKey("mode")) {
-        const char* m = doc["mode"] | "";
-        if (strcmp(m, "sphere") == 0) {
-            self->_led->setOutputMode(LEDManager::OutputMode::Sphere);
-        } else if (strcmp(m, "test") == 0) {
-            self->_led->setOutputMode(LEDManager::OutputMode::Test);
-        } else {
-            return self->sendError(req, "400 Bad Request", "mode must be sphere or test");
-        }
-    }
+    // 指定されたキーだけを反映する (mode / pattern / width / axis はそれぞれ独立)。
+    // 実際の適用は DeviceController (MQTT の led コマンドと同じ経路)。
+    DeviceController& ctl = *self->_ctl;
     if (doc.containsKey("pattern") || doc.containsKey("width")) {
-        const char* pat = doc["pattern"] | (self->_led->getTestPattern() == LEDManager::TestPattern::Chase ? "chase" : "strip");
-        int w = doc["width"] | (int)self->_led->getTestWidth();
+        const char* pat = doc["pattern"] | ctl.testPatternName();
+        const int w = doc["width"] | (int)ctl.testWidth();
         if (w < 1 || w > 60) {
             return self->sendError(req, "400 Bad Request", "width out of range (1-60)");
         }
-        if (strcmp(pat, "strip") == 0) {
-            self->_led->setTestPattern(LEDManager::TestPattern::StripId, (uint8_t)w);
-        } else if (strcmp(pat, "chase") == 0) {
-            self->_led->setTestPattern(LEDManager::TestPattern::Chase, (uint8_t)w);
-        } else {
+        if (!ctl.setTestPattern(pat, w)) {
             return self->sendError(req, "400 Bad Request", "pattern must be strip or chase");
         }
     }
+    if (doc.containsKey("mode")) {
+        DeviceController::LedMode m;
+        if (!DeviceController::parseLedMode(doc["mode"] | "", m)) {
+            return self->sendError(req, "400 Bad Request", "mode must be sphere, test, off or pixels");
+        }
+        ctl.setLedMode(m);
+    }
     if (doc.containsKey("axis")) {
-        const bool on = doc["axis"] | false;
-        self->_led->setAxisIndicator(on);
-        Settings::setAxisIndicator(on);  // 次回起動でも復元する
+        ctl.setAxisIndicator(doc["axis"] | false);
     }
 
     snprintf(self->_jsonBuf, sizeof(self->_jsonBuf),
              "{\"ok\":true,\"mode\":\"%s\",\"pattern\":\"%s\",\"width\":%u,\"axis\":%s}",
-             self->_led->getOutputMode() == LEDManager::OutputMode::Test ? "test" : "sphere",
-             self->_led->getTestPattern() == LEDManager::TestPattern::Chase ? "chase" : "strip",
-             (unsigned)self->_led->getTestWidth(),
-             self->_led->getAxisIndicator() ? "true" : "false");
+             ctl.ledModeName(), ctl.testPatternName(), (unsigned)ctl.testWidth(),
+             ctl.axisIndicator() ? "true" : "false");
     return self->sendJson(req, "200 OK", self->_jsonBuf);
 }
 
@@ -617,30 +620,19 @@ esp_err_t SoloWebServer::onImuPost(httpd_req_t* req) {
         return self->sendError(req, "400 Bad Request", "invalid json");
     }
     IMUManager& imu = *self->_imu;
-    if (doc.containsKey("smooth_frames")) {
-        const int n = doc["smooth_frames"] | 1;
-        if (n < 1 || n > (int)IMUManager::kSmoothMax) {
-            return self->sendError(req, "400 Bad Request", "smooth_frames out of range");
-        }
-        imu.setSmoothFrames((uint8_t)n);
-        Settings::setImuSmoothFrames((uint8_t)n);   // 再起動後も維持する
+    DeviceController& ctl = *self->_ctl;
+    if (doc.containsKey("smooth_frames") && !ctl.setImuSmooth(doc["smooth_frames"] | 1)) {
+        return self->sendError(req, "400 Bad Request", "smooth_frames out of range");
     }
-    if (doc.containsKey("i2c_khz")) {
-        const int khz = doc["i2c_khz"] | 100;
-        if (khz < 50 || khz > 400) {   // 10kHz 指定で core1 が飢餓した事故があるため下限 50
-            return self->sendError(req, "400 Bad Request", "i2c_khz out of range (50-400)");
-        }
-        imu.setI2cClock((uint32_t)khz * 1000);
+    if (doc.containsKey("i2c_khz") && !ctl.setImuI2cKhz(doc["i2c_khz"] | 100)) {
+        return self->sendError(req, "400 Bad Request", "i2c_khz out of range (50-400)");
     }
-    if (doc.containsKey("aux")) imu.setAuxReads(doc["aux"] | true);
-    if (doc.containsKey("word_read")) imu.setWordRead(doc["word_read"] | true);
-    if (doc.containsKey("reset") && (doc["reset"] | false)) imu.requestReset();
-    if (doc.containsKey("reset_timing") && (doc["reset_timing"] | false)) imu.debugResetTiming();
-    if (doc.containsKey("dump")) {
-        const int n = doc["dump"] | 0;
-        if (n < 1 || n > 2000 || !imu.startRawDump((uint16_t)n)) {
-            return self->sendError(req, "400 Bad Request", "dump must be 1-2000 (or PSRAM alloc failed)");
-        }
+    if (doc.containsKey("aux")) ctl.setImuAux(doc["aux"] | true);
+    if (doc.containsKey("word_read")) ctl.setImuWordRead(doc["word_read"] | true);
+    if (doc.containsKey("reset") && (doc["reset"] | false)) ctl.imuReset();
+    if (doc.containsKey("reset_timing") && (doc["reset_timing"] | false)) ctl.imuResetTiming();
+    if (doc.containsKey("dump") && !ctl.imuDump(doc["dump"] | 0)) {
+        return self->sendError(req, "400 Bad Request", "dump must be 1-2000 (or PSRAM alloc failed)");
     }
     snprintf(self->_jsonBuf, sizeof(self->_jsonBuf),
              "{\"ok\":true,\"smooth\":%u,\"i2c_khz\":%lu,\"aux\":%s,\"word_read\":%s}",
@@ -664,7 +656,7 @@ esp_err_t SoloWebServer::onBrightness(httpd_req_t* req) {
     if (v < 0 || v > 100) {
         return self->sendError(req, "400 Bad Request", "value out of range (0-100)");
     }
-    self->applyBrightness((uint8_t)v);
+    self->_ctl->setBrightnessPct((uint8_t)v);
     snprintf(self->_jsonBuf, sizeof(self->_jsonBuf), "{\"ok\":true,\"brightness\":%d}", v);
     return self->sendJson(req, "200 OK", self->_jsonBuf);
 }
@@ -800,8 +792,8 @@ esp_err_t SoloWebServer::onDelete(httpd_req_t* req) {
 
 esp_err_t SoloWebServer::onReboot(httpd_req_t* req) {
     auto* self = static_cast<SoloWebServer*>(req->user_ctx);
-    self->_player->stop();
-    self->scheduleReboot(500);
+    self->_ctl->stop();
+    self->_ctl->scheduleReboot(500);
     return self->sendJson(req, "200 OK", "{\"ok\":true,\"reboot_in_ms\":500}");
 }
 

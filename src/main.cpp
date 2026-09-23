@@ -27,6 +27,8 @@
 
 #include "SoloPlayer.h"
 #include "SoloWebServer.h"
+#include "DeviceController.h"
+#include "SerialConsole.h"
 
 using namespace sastle;
 
@@ -44,6 +46,8 @@ LCDManager lcdManager;
 OtaManager ota;
 SoloPlayer soloPlayer;
 SoloWebServer soloWeb;
+DeviceController controller;   // HTTP / MQTT / コンソールが共通で呼ぶ操作の窓口
+SerialConsole console;
 
 // LCD に出す Wi-Fi 接続 QR ("WIFI:T:WPA;S:..;P:..;;") と表示用文字列
 static String g_wifiQrText;
@@ -237,9 +241,7 @@ void setup() {
                 ledManager.show();
             }
 
-            // config の params.brightness (0-100%) を LED 輝度 (0-255) へ適用
-            ledManager.setBrightness((uint8_t)map(sastle::Settings::brightness(config.getParamBrightness()), 0, 100, 0, 255));
-            ledManager.setAxisIndicator(sastle::Settings::axisIndicator(ledManager.getAxisIndicator()));
+            // 明るさ (NVS > config.params、γ=2.2) と軸表示は controller.begin() が適用する
 
             // レンダリングタスク開始 (Core 1)
             if (!ledManager.startRenderTask(1, 2, 8192)) {
@@ -248,6 +250,19 @@ void setup() {
         }
     } else {
         sastle::Log.println("LEDManager disabled (ImageManager not available)");
+    }
+
+    // 操作の窓口。起動時の明るさ/軸表示を LED に適用し、以降は Web UI / MQTT / コンソールが
+    // ここを通して操作する (明るさは γ=2.2 で LED 値に変換、変更は NVS に保存)。
+    {
+        DeviceController::Deps deps;
+        deps.config = &config;
+        deps.player = &soloPlayer;
+        deps.led = &ledManager;
+        deps.imu = imuSensor.isInitialized() ? &imuSensor : nullptr;
+        deps.net = &network;
+        controller.begin(deps);
+        console.begin(controller, g_apSsid);
     }
 
     // 再生タスク (Core 0) と Web UI を開始。
@@ -260,7 +275,8 @@ void setup() {
             sastle::Log.println("SoloPlayer initialization failed");
         }
         if (network.isSoftAP()) {
-            if (!soloWeb.begin(config, soloPlayer, ledManager, network, imuSensor, config.getSoloHttpPort())) {
+            if (!soloWeb.begin(controller, config, soloPlayer, ledManager, network, imuSensor,
+                               config.getSoloHttpPort())) {
                 sastle::Log.println("Web server failed to start");
             }
         }
@@ -278,67 +294,6 @@ void setup() {
     }
 
     sastle::Log.println("\n=== Setup Complete ===");
-}
-
-// シリアルコンソール: Web UI に繋げない状況でも状態確認と操作ができる復帰経路。
-// 1行コマンド (改行終端): help | status | play | stop | led sphere|test | reboot
-static void serialConsolePoll() {
-    static char line[64];
-    static size_t len = 0;
-
-    while (Serial.available() > 0) {
-        const char c = (char)Serial.read();
-        if (c == '\r') {
-            continue;
-        }
-        if (c != '\n') {
-            if (len < sizeof(line) - 1) {
-                line[len++] = c;
-            }
-            continue;
-        }
-        line[len] = '\0';
-        len = 0;
-
-        char* cmd = line;
-        while (*cmd == ' ') cmd++;
-        if (*cmd == '\0') {
-            continue;
-        }
-
-        if (strcmp(cmd, "help") == 0) {
-            Serial.println("[CONSOLE] commands: status | play | stop | led sphere|test | reboot");
-        } else if (strcmp(cmd, "status") == 0) {
-            Serial.printf("[CONSOLE] ap=%s ip=%s clients=%u heap=%u psram=%u\n",
-                          g_apSsid.c_str(), network.apIP().toString().c_str(),
-                          (unsigned)network.clientCount(),
-                          (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
-            SoloPlayer::Stats s = soloPlayer.stats();
-            Serial.printf("[CONSOLE] state=%s video=%s frames=%u fps=%.1f miss=%u error=%s\n",
-                          soloPlayer.stateName(), soloPlayer.videoPath().c_str(),
-                          (unsigned)soloPlayer.videoFrames(), s.fps, (unsigned)s.deadlineMisses,
-                          soloPlayer.lastError() ? soloPlayer.lastError() : "-");
-        } else if (strcmp(cmd, "play") == 0) {
-            soloPlayer.play();
-            Serial.printf("[CONSOLE] state=%s\n", soloPlayer.stateName());
-        } else if (strcmp(cmd, "stop") == 0) {
-            soloPlayer.stop();
-            Serial.printf("[CONSOLE] state=%s\n", soloPlayer.stateName());
-        } else if (strcmp(cmd, "led sphere") == 0) {
-            ledManager.setOutputMode(LEDManager::OutputMode::Sphere);
-            Serial.println("[CONSOLE] led output = sphere (video + IMU)");
-        } else if (strcmp(cmd, "led test") == 0) {
-            ledManager.setOutputMode(LEDManager::OutputMode::Test);
-            Serial.println("[CONSOLE] led output = test pattern");
-        } else if (strcmp(cmd, "reboot") == 0) {
-            Serial.println("[CONSOLE] rebooting...");
-            Serial.flush();
-            delay(100);
-            ESP.restart();
-        } else {
-            Serial.printf("[CONSOLE] unknown command: %s (try 'help')\n", cmd);
-        }
-    }
 }
 
 // 性能計測ログ (2秒間隔): 描画/デコード時間と再生統計
@@ -426,9 +381,10 @@ void loop() {
     network.poll();   // STA 接続状態の変化をログに出し、切断時はバックオフ再接続
     sastle::Log.loop();   // 退避ログを MQTT へ (sink 未登録なら即 return)
     soloWeb.loop();
+    controller.tick();    // 設定の遅延保存と予約済み再起動
 
     // シリアルコンソール
-    serialConsolePoll();
+    console.poll();
 
     // LCD (デバッグ表示が有効な場合のみ)
     if (lcdManager.isDebugEnabled()) {
