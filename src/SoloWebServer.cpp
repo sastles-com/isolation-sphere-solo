@@ -149,7 +149,7 @@ async function refresh(){if(busy)return;try{const r=await fetch('/api/status',{c
  if(s.source){const R=s.source;const an={local:'本体の動画',network:'配信 (UDP)',none:'なし'}[R.active]||R.active;
   $('src').textContent=`${an} / ${R.net_fps.toFixed(1)} fps 受信 (${R.net_frames} 枚, 欠落 ${R.reasm_drop})`;
   const sel=(id,on)=>$(id).className=on?'':'gray';sel('s_auto',R.mode==='auto');sel('s_local',R.mode==='local');sel('s_net',R.mode==='network')}
- if(s.server){const S=s.server;$('srv').textContent=S.enabled&&S.ssid?`ON: ${S.ssid} / ${S.broker}`:'OFF (本体のみ)';
+ if(s.server){const S=s.server;$('srv').textContent=S.enabled&&S.ssid?`ON: ${S.ssid} / ${S.broker} (MQTT ${S.mqtt?'接続中':'未接続'})`:'OFF (本体のみ)';
   $('srv_on').className=S.enabled?'':'gray';$('srv_off').className=S.enabled?'gray':''}
  $('play').disabled=!(s.state==='stopped'||s.state==='paused');$('pause').disabled=s.state!=='playing';$('stop').disabled=!(s.state==='playing'||s.state==='paused');
  $('del').disabled=!s.video.present||s.state==='uploading';
@@ -415,7 +415,7 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
         "\"fs\":{\"total\":%u,\"used\":%u,\"free\":%u,\"max_upload\":%u},"
         "\"ap\":{\"ssid\":\"%s\",\"ip\":\"%s\",\"clients\":%u},"
         "\"sta\":{\"enabled\":%s,\"connected\":%s,\"ssid\":\"%s\",\"ip\":\"%s\",\"origin\":\"%s\"},"
-        "\"server\":{\"configured\":%s,\"enabled\":%s,\"ssid\":\"%s\",\"broker\":\"%s\"},"
+        "\"server\":{\"configured\":%s,\"enabled\":%s,\"ssid\":\"%s\",\"broker\":\"%s\",\"mqtt\":%s},"
         "\"source\":{\"mode\":\"%s\",\"active\":\"%s\",\"net_frames\":%u,\"net_fps\":%.1f,\"net_errors\":%u,"
         "\"udp_rx\":%u,\"udp_drop\":%u,\"reasm_drop\":%u,\"last_net_ms\":%u,\"udp_listening\":%s},"
         "\"led\":{\"mode\":\"%s\",\"pattern\":\"%s\",\"width\":%u,\"axis\":%s},"
@@ -444,6 +444,7 @@ esp_err_t SoloWebServer::onStatus(httpd_req_t* req) {
         self->_ctl->serverConfigured() ? "true" : "false",
         self->_config->getWiFiConfig().enabled ? "true" : "false",
         self->_config->getWiFiSSID().c_str(), self->_config->getMQTTBroker().c_str(),
+        self->_ctl->mqttConnected() ? "true" : "false",
         self->_ctl->sourceModeName(), self->_ctl->activeSourceName(),
         (unsigned)ps.netFrames, ps.netFps, (unsigned)ps.netDecodeErrors,
         (unsigned)udpRx, (unsigned)udpDrop, (unsigned)ps.reasmDropped,

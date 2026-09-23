@@ -228,6 +228,8 @@ void GestureManager::enterUIMode() {
     }
     
     logEvent("triple_shake -> ui_active");
+    publishGestureEvent("triple_shake");
+    publishUIModeEvent("active");
 }
 
 void GestureManager::exitUIMode() {
@@ -247,6 +249,7 @@ void GestureManager::exitUIMode() {
     }
     
     logEvent("ui_normal");
+    publishUIModeEvent("normal");
 }
 
 void GestureManager::executeAction(Axis axis, Direction dir) {
@@ -260,13 +263,38 @@ void GestureManager::executeAction(Axis axis, Direction dir) {
     }
     
     logEvent(action);
-    
+    publishRotationEvent(axis, dir, ROTATION_THRESHOLD, action);
+
     // TODO: 実際のアクション実行（画像切り替え、輝度変更など）
     // これは後でImageManager、LEDManagerと連携
 }
 
 void GestureManager::logEvent(const char* event) {
     Serial.printf("[Gesture] %s (t=%lu)\n", event ? event : "?", millis());
+}
+
+// 外部通知 (server モードでは sphere/<id>/gesture, sphere/<id>/ui_mode)。JSON は派生元と同一。
+void GestureManager::publishGestureEvent(const char* event) {
+    if (!_sink) return;
+    char json[96];
+    snprintf(json, sizeof(json), "{\"event\":\"%s\",\"timestamp\":%lu}", event, (unsigned long)millis());
+    _sink("gesture", json);
+}
+
+void GestureManager::publishRotationEvent(Axis axis, Direction dir, float angle, const char* action) {
+    if (!_sink) return;
+    char json[160];
+    snprintf(json, sizeof(json),
+             "{\"event\":\"rotation\",\"axis\":\"%s\",\"direction\":\"%s\",\"angle\":%.1f,\"action\":\"%s\"}",
+             axisToString(axis), directionToString(dir), angle, action);
+    _sink("gesture", json);
+}
+
+void GestureManager::publishUIModeEvent(const char* mode) {
+    if (!_sink) return;
+    char json[64];
+    snprintf(json, sizeof(json), "{\"mode\":\"%s\",\"timeout\":%d}", mode, (int)UI_MODE_TIMEOUT_MS);
+    _sink("ui_mode", json);
 }
 
 void GestureManager::setOnModeChange(std::function<void(Mode)> callback) {

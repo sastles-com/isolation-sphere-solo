@@ -3,6 +3,7 @@
 #include "LEDManager.h"
 #include "SoloPlayer.h"
 #include "FramePump.h"
+#include "MQTTManager.h"
 
 #include <ArduinoOTA.h>
 
@@ -14,10 +15,12 @@ constexpr const char* kOtaPassword = "isolation-sphere-ota";
 constexpr const char* kOtaDefaultHostname = "isolation-sphere";
 }
 
-bool OtaManager::begin(LEDManager* led, FramePump* pump, SoloPlayer* player, const char* hostname) {
+bool OtaManager::begin(LEDManager* led, FramePump* pump, SoloPlayer* player, const char* hostname,
+                       MQTTManager* mqtt) {
     _led = led;
     _pump = pump;
     _player = player;
+    _mqtt = mqtt;
 
     const char* host = (hostname && hostname[0]) ? hostname : kOtaDefaultHostname;
     ArduinoOTA.setHostname(host);
@@ -34,6 +37,11 @@ bool OtaManager::begin(LEDManager* led, FramePump* pump, SoloPlayer* player, con
         }
         if (_pump) {
             _pump->stopForOta();
+        }
+        // MQTT は offline (retained) を出して切る。server 側が配信を止め、書き込み中の
+        // keep-alive 切れで慌てて再接続しないようにする。
+        if (_mqtt) {
+            _mqtt->disconnect();
         }
         // 描画タスクを止めて Core1 とフラッシュ操作ロックを解放する。
         // stopRenderTask() は協調停止 (show() の途中で殺さない) であること。

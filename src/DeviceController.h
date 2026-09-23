@@ -23,6 +23,7 @@
 #include "FramePump.h"
 #include "IMUManager.h"
 #include "LEDManager.h"
+#include "MQTTManager.h"
 #include "NetworkManager.h"
 #include "SoloPlayer.h"
 
@@ -37,6 +38,7 @@ public:
         IMUManager* imu = nullptr;       ///< 未検出なら nullptr
         NetworkManager* net = nullptr;
         FramePump* pump = nullptr;
+        MQTTManager* mqtt = nullptr;     ///< server 未設定なら nullptr
     };
 
     enum class PlayResult : uint8_t { Ok, NoVideo, Uploading, Unavailable };
@@ -123,6 +125,8 @@ public:
     NetworkManager* net() const { return _d.net; }
     ConfigManager* config() const { return _d.config; }
     FramePump* pump() const { return _d.pump; }
+    MQTTManager* mqtt() const { return _d.mqtt; }
+    bool mqttConnected() const { return _d.mqtt && _d.mqtt->isConnected(); }
 
 private:
     void applyBrightnessToLed(uint8_t pct);

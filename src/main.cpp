@@ -36,6 +36,11 @@
 #include "SerialConsole.h"
 #include "FramePump.h"
 #include "UdpReceiver.h"
+#include "MQTTManager.h"
+#include "MqttTopics.h"
+#include "CommandHandler.h"
+#include "TimeSync.h"
+#include "Telemetry.h"
 
 using namespace sastle;
 
@@ -57,6 +62,36 @@ DeviceController controller;   // HTTP / MQTT / コンソールが共通で呼�
 SerialConsole console;
 UdpReceiver udpRx;             // UDP 映像チャンク受信 (server モード時のみ listen)
 FramePump pump;                // フレーム供給の単一タスク (UDP 再構成 / ローカル再生 → デコード)
+MQTTManager mqtt;              // server モード: 操作受信 / imu・state・log 送信 (broker 設定時のみ)
+CommandHandler commandHandler; // MQTT コマンド → DeviceController
+TimeSync timeSync;             // sphere/all/clock からの共通タイムベース
+Telemetry telemetry;           // imu / state の周期 publish
+
+// MQTT メッセージ受信コールバック (mqtt.loop() 経由で loopTask のみが呼ぶ)
+static void mqttCallback(char* topic, uint8_t* payload, unsigned int length) {
+    // 重要: PubSubClient は送受信で同一バッファを使う。コールバック内で publish
+    // (= Log の MQTT 送出やコマンド応答) を行うと受信中の topic/payload が上書き破損する。
+    // 先にローカルへ退避してから処理する。2KB はスタックに積まず static。
+    char topicCopy[128];
+    strncpy(topicCopy, topic, sizeof(topicCopy) - 1);
+    topicCopy[sizeof(topicCopy) - 1] = '\0';
+    static char payloadCopy[sastle::kMqttBufferSize];
+    const unsigned int len = (length < sizeof(payloadCopy) - 1) ? length : sizeof(payloadCopy) - 1;
+    memcpy(payloadCopy, payload, len);
+    payloadCopy[len] = '\0';
+
+    // 時刻同期ビーコン (1 秒周期) は command 判定より先に捌き、ログも出さない
+    if (strcmp(topicCopy, sastle::topics::kAllClock) == 0) {
+        timeSync.onClockMessage(payloadCopy);
+        return;
+    }
+    if (strstr(topicCopy, "/command/") != nullptr) {
+        sastle::Log.printf("[MQTT] <- %s\n", topicCopy);
+        commandHandler.handleMessage(topicCopy, (uint8_t*)payloadCopy, len);
+    } else {
+        sastle::Log.printf("[MQTT] unhandled topic %s: %s\n", topicCopy, payloadCopy);
+    }
+}
 
 // LCD に出す Wi-Fi 接続 QR ("WIFI:T:WPA;S:..;P:..;;") と表示用文字列
 static String g_wifiQrText;
@@ -199,7 +234,7 @@ void setup() {
     // OTA (espota) 初期化: AP が立った直後に受け口を開く。これ以降の初期化
     // (IMU / LED / 再生 / Web) で失敗・停止しても、無線での書き戻しは生き残る。
     // stopRenderTask() は _taskRunning ガードがあるため未初期化でも安全。
-    ota.begin(&ledManager, &pump, &soloPlayer, config.getSphereID().c_str());
+    ota.begin(&ledManager, &pump, &soloPlayer, config.getSphereID().c_str(), &mqtt);
 
     // IMU初期化前に I2C バスを走査 (BNO055 の有無を切り分けるため)
     scanI2cBus(kImuI2cSda, kImuI2cScl);
@@ -291,6 +326,7 @@ void setup() {
         deps.imu = imuSensor.isInitialized() ? &imuSensor : nullptr;
         deps.net = &network;
         deps.pump = &pump;
+        deps.mqtt = &mqtt;
         controller.begin(deps);
         console.begin(controller, g_apSsid);
     }
@@ -308,6 +344,24 @@ void setup() {
                 sastle::Log.println("Web server failed to start");
             }
         }
+    }
+
+    // server モード: MQTT。受け側 (FramePump + UDP キュー) はこの時点で既に動いている。
+    // server は球体の status/state を見た瞬間に配信を始めるので、MQTT は最後に立てる。
+    // 接続自体は STA が繋がってから mqtt.loop() が行う (起動直後は STA 未接続のことがある)。
+    if (config.isServerConfigured()) {
+        mqtt.setCallback(mqttCallback);
+        if (mqtt.begin(config)) {
+            sastle::Log.setSink(&mqtt, "log");   // 起動ログの退避分もここから流れる
+            commandHandler.begin(&controller);
+            gesture.setEventSink([](const char* suffix, const char* json) {
+                mqtt.publishDevice(suffix, json, false);
+            });
+            telemetry.begin(imuSensor.isInitialized() ? &imuSensor : nullptr, &mqtt, &timeSync,
+                            &controller, config.getTelemetryImuHz());
+        }
+    } else {
+        sastle::Log.println("server mode: off (config wifi{} disabled or no SSID) - MQTT/UDP not started");
     }
 
     // IMU ポーリングを専用タスク (core1, 優先度3) で回す。IMU 初期化の後・setup の最後に置く
@@ -411,6 +465,7 @@ void loop() {
 
     // キャプティブポータル DNS の応答と、HTTP 経由の再起動要求の実行
     network.poll();   // STA 接続状態の変化をログに出し、切断時はバックオフ再接続
+    mqtt.loop();      // keep-alive / 受信 / STA 接続後の (再) 接続 (server 未設定なら即 return)
     sastle::Log.loop();   // 退避ログを MQTT へ (sink 未登録なら即 return)
     soloWeb.loop();
     controller.tick();    // 設定の遅延保存と予約済み再起動
@@ -489,6 +544,11 @@ void loop() {
 
     // 性能計測ログ
     logPerfIfDue(now);
+
+    // server モードの周期 publish (MQTT 接続中のみ)
+    telemetry.publishImuIfDue((uint32_t)now);
+    telemetry.publishStateIfDue((uint32_t)now);
+    telemetry.emitTimeSyncIfDue((uint32_t)now);
 
     delay(10);
 }

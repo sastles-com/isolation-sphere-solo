@@ -107,6 +107,13 @@ public:
      * @return 現在のMode
      */
     Mode getMode() const { return _mode; }
+
+    /**
+     * @brief 検出イベントの外部通知先を登録する (server モードでは MQTT publish)
+     * @param sink (suffix, json) を受ける関数。suffix は "gesture" / "ui_mode"
+     *             (派生元 core と同じトピック sphere/<id>/<suffix>、同じ JSON)
+     */
+    void setEventSink(std::function<void(const char* suffix, const char* json)> sink) { _sink = sink; }
     
 private:
     IMUManager* _imu;           ///< IMUマネージャーポインタ
@@ -133,6 +140,12 @@ private:
     // コールバック
     std::function<void(Mode)> _onModeChange;  ///< モード変更コールバック
     std::function<void(Axis, Direction)> _onSelection;  ///< 選択コールバック
+    std::function<void(const char*, const char*)> _sink;  ///< 外部通知 (MQTT)。未登録ならログのみ
+
+    /// 派生元と同じ JSON を組んで sink に渡す
+    void publishGestureEvent(const char* event);
+    void publishRotationEvent(Axis axis, Direction dir, float angle, const char* action);
+    void publishUIModeEvent(const char* mode);
     
     /**
      * @brief シェイク検出処理

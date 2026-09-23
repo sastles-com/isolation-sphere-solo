@@ -21,6 +21,7 @@ namespace sastle {
 class LEDManager;   // 前方宣言
 class SoloPlayer;
 class FramePump;
+class MQTTManager;
 
 class OtaManager {
 public:
@@ -30,9 +31,11 @@ public:
      * @param pump   OTA 開始時にフレーム供給タスクと UDP 受信を止める (nullptr 可)
      * @param player OTA 開始時に再生状態を Stopped にする (nullptr 可)
      * @param hostname mDNS / espota 上の識別名 (sphere id)
+     * @param mqtt   OTA 開始時に offline を publish して切る (nullptr 可)
      * @return true 初期化成功
      */
-    bool begin(LEDManager* led, FramePump* pump, SoloPlayer* player, const char* hostname);
+    bool begin(LEDManager* led, FramePump* pump, SoloPlayer* player, const char* hostname,
+               MQTTManager* mqtt = nullptr);
 
     /**
      * @brief OTA 要求を処理する (メインループから毎回呼ぶ)
@@ -46,6 +49,7 @@ private:
     SoloPlayer* _player = nullptr;
     FramePump* _pump = nullptr;
     LEDManager* _led = nullptr;
+    MQTTManager* _mqtt = nullptr;
 };
 
 } // namespace sastle
