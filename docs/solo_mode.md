@@ -79,21 +79,25 @@ LittleFS の同梱物 1.35MB → **39KB**。
 
 | 境界 | 実装 |
 | --- | --- |
-| ネットワーク | SoftAP (既定 `isolation-sphere` / 192.168.4.1) + キャプティブ DNS (全ホスト名 → 自分) |
-| 映像入力 | `SoloPlayer` (Core0) が LittleFS `/video.mjpg` を 100ms 締切で読み、`ImageManager::submitJpegFrame()` へ |
-| 制御入力 | `SoloWebServer` (esp_http_server, Core0) / シリアルコンソール (`main.cpp`) |
-| 表示 | `LEDManager` レンダタスク (Core1) + IMU 再マッピング (派生元のまま) |
-| ログ | Serial のみ (`sastle::Log`) |
-| 更新 | USB (`upload` / `uploadfs`) と OTA (espota, AP 経由) |
+| ネットワーク | SoftAP (既定 `isolation-sphere` / 192.168.4.1、常時) + 任意の STA (NVS の LAN > config の P2P 網) + キャプティブ DNS |
+| 映像入力 | `FramePump` (Core0、1 タスク) が UDP 配信 (`UdpReceiver` → `FrameReassembler`) とローカル `SoloPlayer::tick()` を調停 (`SourceArbiter`) し、`ImageManager::submitJpegFrame()` を呼ぶ唯一の場所 |
+| 制御入力 | `SoloWebServer` (esp_http_server) / `CommandHandler` (MQTT) / `SerialConsole` → いずれも `DeviceController` |
+| 表示 | `LEDManager` レンダタスク (Core1) + IMU 再マッピング (`SphereMap.h`) |
+| ログ | `sastle::Log` = `RemoteLog`: Serial + (server モードでは) MQTT `sphere/<id>/log` (PSRAM 退避 12KB) |
+| 更新 | USB (`upload` / `uploadfs`) と OTA (espota: AP 192.168.4.1 / STA の IP) |
+
+§10 に server モード (統合ファーム) の詳細。
 
 ### タスク配置
 
 | タスク | Core | prio | stack | 役割 |
 | --- | --- | --- | --- | --- |
 | `LED_Render` | 1 | 2 | 8192 | IMU 再マッピング + RMT 出力 (~50-60Hz) |
-| `solo_play` | 0 | 1 | 6144 | 100ms 締切で MJPEG 読み出し + JPEG デコード + publish |
+| `imu` | 1 | 3 | 4096 | BNO055 100Hz 読み出し (Log を呼ばない。診断は loop が吐く) |
+| `frame_pump` | 0 | 1 | 8192 | UDP キュー待ち (次のローカル締切まで) → 再構成 → デコード / 締切でローカル 1 フレーム。デコードは必ずここ |
+| `async_udp` | 0 | — | — | AsyncUDP コールバック: データグラムを PSRAM キューへ (server モードのみ) |
 | `httpd` | 0 | 2 | 8192 | Web UI / API / アップロード受信 (FS 書き込み) |
-| `loopTask` | 1 | 1 | 8192 | IMU 100Hz、ジェスチャー、LCD (QR/映像)、DNS 応答、シリアルコンソール |
+| `loopTask` | 1 | 1 | 8192 | OTA、STA 再接続、MQTT loop、ログ flush、DNS、設定保存/再起動、ジェスチャー、LCD、周期ログ・publish |
 | WiFi/lwIP | 0 | 高 | — | SDK |
 
 アップロード中 (FS 書き込み中) は再生を止める。フラッシュ書き込みはキャッシュ無効化で両コアに
@@ -287,13 +291,18 @@ AP 経由 (`atoms3r_ota` → 192.168.4.1) は、書き込む PC の Wi-Fi を球
 - Web UI の「LAN 接続 (開発用 / 任意)」に普段の Wi-Fi の SSID / パスワードを入れて保存 → 再起動
 - 球体は **AP を維持したまま** STA でも接続する (`WIFI_AP_STA`)。iPhone は従来どおり AP に繋がる
 - PC は普段の LAN のまま `tools/ota.sh` (中身は `pio run -e atoms3r_lan_ota -t upload --upload-port <IP>`)
-  で書き込める。mDNS の `isolation-sphere.local` は PC 側で時々解決に失敗する (`getent` は通るのに
-  espota が `Host Not Found`、実機 2026-09-23) ので、スクリプトが先に IP を解決して直指定する。
-  解決できないときは `SPHERE_IP=<IP> tools/ota.sh` (IP は Web UI の「LAN (STA)」欄 / `/api/status` の `sta.ip`)
+  で書き込める。mDNS 名は `<sphere id>.local` (既定 `sphere001.local`) だが PC 側で時々解決に失敗する
+  (`getent` は通るのに espota が `Host Not Found`、実機 2026-09-23) ので、スクリプトが先に IP を解決して
+  直指定する。解決できないときは `SPHERE_IP=<IP> tools/ota.sh` (IP は Web UI の「LAN (STA)」欄 /
+  `/api/status` の `sta.ip`)。server モードでは P2P 網の固定 IP (例 192.168.49.101) を指定する
 
-資格情報は **NVS に保存**する (`Preferences`, namespace `solo`)。config.json に書かないのは、
+LAN の資格情報は **NVS に保存**する (`Preferences`, namespace `solo`)。config.json に書かないのは、
 自宅 Wi-Fi のパスワードがリポジトリに混入するのを避けるため。SSID を空で保存すると無効化。
-`/api/status` に `sta:{enabled,connected,ssid,ip}` が出る。
+P2P 網 (配信 server) の SSID/パスワードは派生元と同じく config.json `wifi{}` に置く (固定値)。
+優先順は **NVS > config.json** (利用者が変えた値が勝つ。明るさと同じ規則)。
+`/api/status` に `sta:{enabled,connected,ssid,ip,origin}` (`origin` = `nvs|config|none`) が出る。
+STA は起動時に先行して最大 2 秒待ち、AP を STA と同じチャンネルで立てる。相手 AP が居ないときは
+5s→60s のバックオフで再接続する (autoReconnect の連続スキャンで SoftAP の応答が鈍るのを防ぐ)。
 
 注意: ESP32 は AP と STA で無線を共有するため、**AP のチャンネルは STA 側に追従する**。
 STA が 5GHz 専用 AP にしか繋がらない環境では使えない (ESP32-S3 は 2.4GHz のみ)。
@@ -304,10 +313,14 @@ STA が 5GHz 専用 AP にしか繋がらない環境では使えない (ESP32-S
 | --- | --- | --- | --- |
 | GET | `/` | — | Web UI (`?cna=1` でキャプティブ画面向けバナー。`uiServed` を立てる) |
 | GET | `/convert` | — | 動画変換ページ (ブラウザ内で 320×160/10fps の raw MJPEG に変換し、そのまま `/api/video` へ) |
-| GET | `/api/status` | — | 状態・動画情報・統計・容量・AP 情報 (`ap.clients` = 接続端末数) |
-| POST | `/api/play` / `/api/pause` / `/api/stop` | — | 再生 / 一時停止 (表示維持) / 停止 (消灯) (uploading 中は 409) |
-| POST | `/api/wifi` | `{ssid, password}` | STA (LAN) の資格情報を NVS に保存。空 SSID で無効化。反映は再起動後 |
-| POST | `/api/brightness` | `{"value":0-100}` | 明るさ (再起動で `params.brightness` に戻る) |
+| GET | `/api/status` | — | 状態・動画情報・統計・容量・`ap` / `sta` / `server{configured,enabled,ssid,broker,mqtt}` / `source{mode,active,net_fps,udp_rx,reasm_drop,...}` / `led` / `imu` |
+| POST | `/api/play` / `/api/pause` / `/api/stop` | — | ローカル再生 / 一時停止 (表示維持) / 停止 (消灯) (uploading 中・動画なしは 409)。配信中は表示は配信が握り、停止は配信終了後に効く |
+| POST | `/api/led` | `{mode, pattern, width, axis}` | `mode`: sphere / test / off / pixels、`pattern`: strip / chase、`width` 1-60、`axis` bool |
+| GET/POST | `/api/imu` | `{smooth_frames, i2c_khz, aux, word_read, reset, dump, reset_timing}` | IMU 診断と実行時スイッチ (`?dump=1` で生サンプル) |
+| POST | `/api/source` | `{"mode":"auto|local|network"}` | 映像ソースの調停モード (再起動不要、保存しない) |
+| POST | `/api/server` | `{"enabled":bool}` | config.json `wifi.enabled` を書き換えて保存し 0.8 秒後に再起動 (`"reboot":false` で保存のみ)。`wifi{}` が無ければ P2P 網の既定値で作る |
+| POST | `/api/wifi` | `{ssid, password}` | STA (LAN) の資格情報を NVS に保存。空 SSID で無効化 (config の P2P 網に戻る)。反映は再起動後 |
+| POST | `/api/brightness` | `{"value":0-100}` | 明るさ % (γ=2.2 で LED 値に変換。NVS に保存) |
 | POST | `/api/video` | 動画本体 (`application/octet-stream`) | アップロード。成功 200 / 検証失敗 400 / 容量不足 507 / 競合 409 |
 | POST | `/api/video/delete` | — | 動画削除 → `no_video` |
 | POST | `/api/reboot` | — | 再起動 |
@@ -326,9 +339,10 @@ curl -s -X POST -d '{"value":30}' http://192.168.4.1/api/brightness
 
 | 項目 | 保存先 | 書き込み契機 |
 | --- | --- | --- |
-| 明るさ | NVS (`solo`/`bri`) | `/api/brightness` の最後の変更から 3 秒後に 1 回 ([Settings.cpp](../src/Settings.cpp))。再起動要求時は即座に確定 |
+| 明るさ / XYZ 軸表示 / IMU 平滑 | NVS (`solo`/`bri`,`axis`,`smooth`) | Web UI・MQTT どちらから変えても、最後の変更から 3 秒後に 1 回 ([Settings.cpp](../src/Settings.cpp))。再起動要求時は即座に確定 |
 | STA (LAN) の SSID / パスワード | NVS (`solo`/`sta_ssid`,`sta_pass`) | `/api/wifi` |
-| 解像度・AP・動画パス・オープニング等 | `config.json` | `uploadfs` |
+| server 接続の ON/OFF (`wifi.enabled`) | `config.json` (球体上) | `/api/server` / コンソール `server on|off` → `saveConfig()` → 再起動 |
+| 解像度・AP・P2P 網・broker・調停・spheres[]・オープニング等 | `config.json` | `uploadfs` |
 
 スライダーは操作中に値が連続で飛んでくるため、変更のたびに書くとフラッシュを無駄に消耗する。
 `Settings::setBrightness()` は RAM を更新して保留にするだけで、`Settings::tick()` が最後の変更から
@@ -341,8 +355,18 @@ curl -s -X POST -d '{"value":30}' http://192.168.4.1/api/brightness
 | `solo.video_path` | `/video.mjpg` | 再生する動画 |
 | `solo.http_port` | `80` | Web UI のポート |
 | `solo.ap.ssid` / `password` / `ip` | `isolation-sphere` / `sphere-solo` / `192.168.4.1` | SoftAP。パスフレーズが 8 文字未満ならオープン AP で起動し警告を出す (QR も `T:nopass`) |
+| `wifi.mode` | `auto` | `auto` (STA 資格情報があれば AP+STA) / `ap` (STA を使わない。NVS も無視) / `ap_sta` |
+| `wifi.enabled` | `true` | server 接続 (P2P 網 STA + MQTT + UDP) の ON/OFF。Web UI の「サーバ接続」が書き換える |
+| `wifi.SSID` / `password` | `ESP32-P2P-Direct` / … | 配信 server の P2P 網 (派生元と同じ鍵名・値。Python server も同じファイルを読む) |
+| `wifi.broker` / `mqtt_port` / `udp_port` | `192.168.49.1` / `1883` / `8889` | MQTT ブローカーと UDP 映像ポート。`broker` 空なら MQTT を使わない |
+| `source.mode` | `auto` | 映像ソースの調停 (§10)。`local` / `network` で固定も可 |
+| `source.idle_timeout_ms` | `2000` | 配信がこの時間途切れたらローカルへ戻す |
+| `source.idle_blank` | `true` | 途切れ後にローカル再生が無ければ黒 (`false` = 最終フレーム保持) |
+| `source.udp_queue_len` | `32` | UDP 受信キュー段数 (1 段 ≈ 1.5KB、PSRAM) |
+| `telemetry.imu_hz` | `10` | MQTT `sphere/<id>/imu` の publish レート (0 で無効。接続中のみ) |
+| `spheres[]` | sphere001/002 | MAC → 自機エントリ (id / static_ip / features)。旧形式の単一 `sphere{}` も受理。MAC 不一致なら空 mac の枠 → 先頭 (警告ログ) |
 | `image.width` / `height` | `320` / `160` | 受理する解像度 |
-| `params.brightness` | `50` | 起動時の明るさ [%] |
+| `params.brightness` | `50` | 起動時の明るさ [%] (γ=2.2 で LED 値へ。50% → 55/255) |
 | `system.opening_action` | `enabled: true, 1200ms` | 起動時の LED オープニング |
 | `system.debug` | `true` | `DEBUG_*` マクロのログ出力 |
 | `sphere.features.LCD.debug` | `true` | LCD 表示 (QR / 映像 / STANDBY)。`false` で LCD 無効 |
@@ -616,6 +640,8 @@ ConfigManager のコンパイル時既定値で続行する。`ota.begin()` を 
 10. **ブラウザ変換** (`docs/convert.html`): iPhone Safari で `requestVideoFrameCallback` が動くか
     (非対応ならシーク方式に落ちる)。変換所要時間・1f あたりのバイト数・生成した `.mjpg` が
     アップロード検証を通るか。`<input type=file>` から camera roll の動画を選べるか
+11. **統合ファーム (§10)**: 2026-09-23 の Phase 0〜5 はビルドと native テストのみで、**実機は未確認**。
+    §10 の検証手順を順に実施する (solo 退行 → UDP 配信 → MQTT → OTA)
 
 ### 既知の制約
 
@@ -629,6 +655,81 @@ ConfigManager のコンパイル時既定値で続行する。`ota.begin()` を 
 - QR 表示は LCD 搭載機 (AtomS3R) かつ `LCD.debug = true` のときのみ
 - iOS の「ログイン」画面 (CNA) ではファイル選択ダイアログが出ない → 既定でキャプティブポータルを抑止し、LCD の URL QR から Safari で開く導線にした (§6)
 - `TJpg_Decoder` はグローバル単一インスタンスのため、デコードを複数タスクから同時に呼べない
-  (現状 `SoloPlayer` タスクのみが呼ぶ)
-- LED 出力モード `Manual` (外部から画素を直接書く) は制御経路が無いため実質未使用。
-  `Test` パターンはシリアルコンソール `led test` から確認できる
+  → 配信・ローカルとも `FramePump` の 1 タスクが順番にデコードする (§10)
+- LED 出力モード `Manual` は `mode: off / pixels` (Web UI `/api/led`、MQTT `led`) から使う。
+  `pixels` の一括更新は MQTT 2KB の制約で ~50 LED/メッセージ (全球は UDP 映像経路で)
+
+## 10. server モード (統合ファーム: server あり / なし を 1 バイナリで)
+
+2026-09-23 に派生元 `feat/ui-v2` の server 系モジュール (MQTT / UDP 映像) を本リポジトリへ移植し、
+solo と server を **同じファーム**で動かすようにした。計画: `~/.claude/plans/server-expressive-parnas.md`。
+**実機確認は未了** (ビルドと native テスト 67 件のみ)。
+
+### 方針
+
+- 本リポジトリが superset。派生元 `core/` は凍結し、Python server はそのまま使う (プロトコル凍結:
+  UDP 16B ヘッダ magic `0x4A504547` / 1400B チャンク / ≤46 チャンク、MQTT `sphere/<id>/...`、
+  retained `state` ≤768B)
+- デコードは `FramePump` の 1 タスクだけ。配信 (UDP) とローカル (MJPEG) を同じタスクが順番に処理する
+- 調停は `auto`: 配信の完成フレームが `idle_timeout_ms` 以内に届いていれば配信を表示、途切れたら
+  ローカルへ (Playing なら続きから、そうでなければ黒)。`local` は配信を読み捨て、`network` はローカルを止める
+- 制御面 (Web UI / MQTT / コンソール) は `DeviceController` 1 つを呼ぶ。明るさは両方 γ=2.2、
+  変更はどこから来ても NVS に保存
+- AP は常時 (iPhone)。STA は NVS の LAN > config の P2P 網 (固定 IP は `spheres[].static_ip`)
+- server モードの ON/OFF は config.json `wifi.enabled`。**Web UI の「サーバ接続」/ コンソール
+  `server on|off` が球体上の config.json を書き換えて再起動**する (OTA では LittleFS を更新できない)。
+  `wifi{}` が無い旧 config には P2P 網の既定値を書き込む
+
+### 起動順と挙動
+
+1. `Log.begin()` (PSRAM 退避) → FS → config (spheres[] を MAC で解決、警告あり) → Settings (NVS)
+2. `NetworkManager::begin`: STA 先行 (≤2s) → SoftAP を同じチャンネルで
+3. OTA (hostname = sphere id) → IMU → ImageManager → **FramePump 起動 → UDP listen** (server 設定時)
+4. LED → `DeviceController::begin` (明るさ/軸を適用) → SoloPlayer (ファイルを開く、タスクは持たない)
+   → Web UI → **MQTT** (最後。server は status/state を見た瞬間に配信を始めるため受け側を先に作る)
+   → IMU タスク
+5. loop: OTA → STA poll (バックオフ再接続) → `mqtt.loop` (STA 接続後に接続。切断時 5s 毎) →
+   `Log.loop` (退避ログを 3 行/周) → DNS → 設定保存/再起動 → コンソール → LCD → ジェスチャー →
+   周期ログ → imu (10Hz) / state (5s retained) publish
+
+配信中の操作: `stop` / `pause` はローカル再生の状態だけ変える (黒要求は配信が表示を握っている間は
+保留され、配信終了 + idle_timeout 後に効く)。Playing のままなら配信終了後に続きから再開。
+
+MQTT: 受信 `sphere/<id>/command/#`、`sphere/all/command/#`、`sphere/all/clock` (TimeSync)。送信
+`status` (online, retained)、`state` (5s, retained)、`imu` (10Hz)、`log` (RemoteLog)、`gesture` / `ui_mode`。
+`led.source` (local/network/none) を `state.led` に追加した (server は未知キーを無視する)。
+
+### メモリ (ビルド実測、atoms3r)
+
+| | Phase 0 (solo のみ) | Phase 5 (統合) |
+| --- | --- | --- |
+| Flash (2MB スロット) | 1,366,793 B (65.2%) | 1,487,237 B (70.9%) |
+| 静的 RAM | 62,712 B | 72,296 B (+9.6KB: UDP 作業領域 3KB、MQTT 退避 2KB、CommandHandler 2KB、Telemetry state 0.8KB ほか) |
+| ヒープ (見積) | 空き ~205KB | −8KB (frame_pump) +6KB (solo_play 廃止) −~12KB (async_udp / PubSubClient 2KB / TCP) → ~190KB。UDP キュー 48KB と Log 退避 12KB は PSRAM |
+| PSRAM | ~7.6MB 空き | −64KB 再構成 −48KB キュー −12KB 退避 |
+
+### 実機検証手順 (未実施)
+
+1. **solo 退行なし** (`wifi.enabled=false` または旧 config): 起動、QR、再生 fps=10 miss=0、停止で黒、
+   一時停止、アップロード、明るさ (見た目が暗くなる: γ2.2)、`/api/status` の `source.active=local`、
+   `[PERF] src=local pump_stack=`、OTA (AP / LAN)。`[QDIAG]` の ortho/norm が 0 付近
+2. **UDP 配信のみ** (server 不要): NVS の LAN に接続した状態で PC から
+   `python3 tools/stream_to_sphere.py --target <STA IP> --fps 15` → 1 フレーム以内に `source.active=network`、
+   `net_fps≈15`、`reasm_drop` が増えない。Ctrl-C → 約 2 秒後にローカルへ復帰 (Playing なら続き、
+   Stopped なら黒)。`/api/source {"mode":"local"}` で配信を無視、`network` でローカル停止
+3. **server あり**: `/api/server {"enabled":true}` → 再起動後 STA が P2P 網に固定 IP で入る
+   (`sta.origin=config`。NVS に LAN があるとそちらが勝つので `/api/wifi` を空 SSID で保存)。
+   `[MQTT] connected` → server 側で online / ready → 配信開始。Web UI (AP 経由) の BRT / playback /
+   led (test/off/pixels/axis) / system restart が効く。`sphere/<id>/log` に起動ログ。`[TIMESYNC] synced`
+4. **OTA 両経路** (配信中): `atoms3r_ota` (AP) と `tools/ota.sh` (STA IP)。`[OTA] Start` で pump/UDP/MQTT が
+   止まり、再起動後に同じモードへ戻る
+5. **ソーク**: 30 分配信 + 回転。`[MEM]` heap_min、`[BOOT] Reset reason` に TASK_WDT/PANIC が無い。
+   `FASTLED_RMT_MEM_BLOCKS=1` で AP+STA+UDP 下にちらつきが出れば 2 に戻す
+
+### 残課題
+
+- 実機確認 (上記)。特に AP チャンネル追従で iPhone が一瞬切れる挙動と、P2P 網不在時のバックオフ
+- `/api/wifi` と P2P 網の共存 (NVS の LAN が常に勝つ。切り替えは Web UI で空 SSID 保存)
+- 派生元 `core/` への逆流 (IMU 修正・協調停止・FLASH_LOCK) と README のポインタ
+- `[RATE]/[PERF]` など solo の周期ログは `main.cpp` に残したまま (派生元の `Telemetry` に統合していない)
+- `atoms3r_m5imu` env はリンク未確認 (従来どおり)
