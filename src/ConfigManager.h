@@ -247,7 +247,7 @@ public:
     // solo 設定 (未設定時は右側のデフォルト)
     String getSoloVideoPath() { return doc["solo"]["video_path"] | "/video.mjpg"; }
     uint16_t getSoloHttpPort() { return doc["solo"]["http_port"] | 80; }
-    String getSoloApSsid() { return doc["solo"]["ap"]["ssid"] | "isolation-sphere"; }
+    String getSoloApSsid();  ///< 設定の接頭辞 + 基板固有 MAC (最大 32 bytes)
     String getSoloApPassword() { return doc["solo"]["ap"]["password"] | "sphere-solo"; }
     String getSoloApIp() { return doc["solo"]["ap"]["ip"] | "192.168.4.1"; }
 

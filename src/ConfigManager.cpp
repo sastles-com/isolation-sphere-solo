@@ -174,6 +174,20 @@ String ConfigManager::getSelfMac() {
     return _selfMac;
 }
 
+String ConfigManager::getSoloApSsid() {
+    String prefix = doc["solo"]["ap"]["ssid"] | "isolation-sphere";
+    if (prefix.length() == 0) prefix = "isolation-sphere";
+    const String suffix = "-" + _normalizeMac(getSelfMac());
+    // SSID は最大 32 bytes。UTF-8 の文字の途中では切らない。
+    const size_t maxPrefix = 32 - suffix.length();
+    if (prefix.length() > maxPrefix) {
+        size_t end = maxPrefix;
+        while (end > 0 && ((unsigned char)prefix[end] & 0xc0) == 0x80) --end;
+        prefix = prefix.substring(0, end);
+    }
+    return prefix + suffix;
+}
+
 void ConfigManager::_parseSphereEntry(JsonVariantConst src, SphereConfig& out) {
     out.id = src["id"] | "sphere001";
     out.mac = src["mac"] | "";

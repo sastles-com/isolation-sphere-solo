@@ -55,7 +55,7 @@ progress{width:100%;height:14px}
 .st.playing{background:#1e8449}.st.paused{background:#7d6608}.st.error{background:#c0392b}.st.uploading{background:#d68910}
 small{color:#888}#msg{min-height:1.2em;color:#f5b041;font-size:14px;word-break:break-all}
 </style></head><body>
-<h1>Isolation Sphere <small>solo</small></h1>
+<h1 id="deviceName">Isolation Sphere <small>solo</small></h1>
 <div id="cna" class="card" hidden style="background:#3b2f00"><b>接続できました。</b><br><small>この「ログイン」画面ではファイル選択ができない場合があります。動画をアップロードするときは、この画面を閉じてから Safari で <b id="cnaUrl">http://192.168.4.1/</b> を開いてください。再生・停止・明るさはここから操作できます。</small></div>
 <div class="card">
  <div class="row"><span class="k">状態</span><span id="state" class="st">-</span></div>
@@ -133,6 +133,7 @@ async function refresh(){if(busy)return;try{const r=await fetch('/api/status',{c
  $('fs').textContent=`${fmt(s.fs.free)} (最大 ${fmt(s.fs.max_upload)})`;
  if(document.activeElement!==$('bri')){$('bri').value=s.brightness;$('bval').textContent=s.brightness+'%'}
  $('dev').textContent=`${s.device} / AP ${s.ap.ssid} (${s.ap.clients}) / up ${s.uptime_s}s`;
+ $('deviceName').textContent=s.ap.ssid;document.title=s.ap.ssid;
  if(s.imu){const I=s.imu;
   $('i_st').textContent=I.ok?`OK mode=${I.mode} cal=${I.cal}`:'無効 (未検出)';
   $('i_q').textContent=I.quat.map(x=>x.toFixed(3)).join(' ');

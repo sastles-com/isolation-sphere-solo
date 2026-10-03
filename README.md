@@ -124,6 +124,12 @@ docs/handoff.md           実装依頼時の仕様書
 だけは Web UI / コンソールから球体上の config.json を書き換えて再起動できる** (OTA では LittleFS を
 更新できないため)。明るさ・軸表示・IMU 平滑・LAN の資格情報は NVS に保存される。
 
+`solo.ap.ssid` は SSID の接頭辞です。実際の SSID は基板の MAC を付けた
+`isolation-sphere-F09E9E3267D0` のような名前になり、複数台でも区別できます。
+最大 32 bytes に収まるよう接頭辞を短縮し、LCD の接続 QR と Web 画面にも同じ名前を使います。
+更新後は新しい SSID に接続し直してください。server モードの機器 ID・固定 IP は
+`spheres[]` の MAC 登録で割り当てるため、追加基板には重複しない ID と IP を登録してください。
+
 ## 開発
 
 ```bash
@@ -136,3 +142,8 @@ python3 tools/stream_to_sphere.py --target <STA の IP> --fps 15   # UDP 配信�
 ```
 
 詳細・設計判断・実機チェック手順は [docs/solo_mode.md](docs/solo_mode.md) を参照。
+
+Mac で AP 経由の OTA を行う場合は、インターネット接続中に `atoms3r` をビルドし、
+`tools/ota-ap.command` をダブルクリックしてください。ターミナルの案内に従って対象 core の
+AP に接続し、Enter を押すとビルド済みファームを転送します。転送中のインターネット接続は不要です。
+再起動後は新しい SSID に接続して Enter を押すと起動状態を確認できます。
